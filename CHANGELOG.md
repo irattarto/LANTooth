@@ -1,6 +1,10 @@
 # Changelog
 
-## [Unreleased]
+## [0.1.1] — 2026-09-28
+
+PC-side improvement. The phone app is unchanged: 0.1.0 and 0.1.1 are fully
+compatible (same protocol v2), and the 0.1.1 APK is included only to keep the
+version numbers matching.
 
 ### Improved
 - PC: on first run the phone-mic output defaults to an installed virtual cable
