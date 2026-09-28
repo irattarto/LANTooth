@@ -19,6 +19,12 @@ on:
 permissions:
   contents: write
 
+# GitHub occasionally starts two runs for one tag push; queue them instead of
+# letting both race to create the same release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   OPUS_VERSION: "1.5.2"
   OPUS_SHA256: "65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1"
@@ -136,5 +142,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" artifacts/* \
-            --title "LANTooth $GITHUB_REF_NAME" --notes-file notes.md
+          # Idempotent: a re-run (or duplicate run) refreshes the existing release.
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" artifacts/* --clobber
+            gh release edit "$GITHUB_REF_NAME" --title "LANTooth $GITHUB_REF_NAME" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" artifacts/* \
+              --title "LANTooth $GITHUB_REF_NAME" --notes-file notes.md
+          fi
