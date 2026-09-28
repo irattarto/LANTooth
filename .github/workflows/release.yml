@@ -1,0 +1,140 @@
+# Builds and publishes a GitHub Release when a version tag is pushed:
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# The tag must match the repo-root VERSION file ("v" + VERSION). Produces:
+#   LANTooth-<ver>-setup.exe      Windows installer (Inno Setup)
+#   LANTooth-<ver>-win64.zip      portable Windows build
+#   LANTooth-<ver>.apk            Android app, release-signed
+#
+# Android signing uses repository secrets ANDROID_KEYSTORE_B64 (base64 of the
+# .jks), ANDROID_KEYSTORE_PASSWORD and ANDROID_KEY_ALIAS.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:   # manual dry run: builds everything, publishes nothing
+
+permissions:
+  contents: write
+
+env:
+  OPUS_VERSION: "1.5.2"
+  OPUS_SHA256: "65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1"
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: v
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match VERSION ($version)"; exit 1
+          fi
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Build libopus (opus.dll) from the pinned release tarball
+        shell: pwsh
+        run: |
+          $v = $env:OPUS_VERSION
+          Invoke-WebRequest "https://downloads.xiph.org/releases/opus/opus-$v.tar.gz" -OutFile opus.tar.gz
+          if ((Get-FileHash opus.tar.gz -Algorithm SHA256).Hash -ne $env:OPUS_SHA256) { throw "opus tarball checksum mismatch" }
+          tar xzf opus.tar.gz
+          cmake -S "opus-$v" -B opus-build -A x64 `
+            -DOPUS_BUILD_SHARED_LIBRARY=ON -DOPUS_STATIC_RUNTIME=ON `
+            -DOPUS_BUILD_TESTING=OFF -DOPUS_BUILD_PROGRAMS=OFF
+          cmake --build opus-build --config Release
+          Copy-Item opus-build\Release\opus.dll pc\opus.dll
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build exe, zip and installer
+        shell: pwsh
+        run: pc\build_exe.ps1 -Installer
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: |
+            pc/dist/LANTooth-${{ needs.version.outputs.version }}-setup.exe
+            pc/dist/LANTooth-${{ needs.version.outputs.version }}-win64.zip
+          if-no-files-found: error
+
+  android:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Signing config
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then echo "::error::ANDROID_KEYSTORE_B64 secret missing"; exit 1; fi
+          echo "$KEYSTORE_B64" | base64 -d > android/lantooth-release.jks
+          printf 'storeFile=../lantooth-release.jks\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+            "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEYSTORE_PASSWORD" > android/keystore.properties
+
+      - name: Build release APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --console=plain
+          mkdir -p ../out
+          cp app/build/outputs/apk/release/app-release.apk "../out/LANTooth-${{ needs.version.outputs.version }}.apk"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: android
+          path: out/LANTooth-${{ needs.version.outputs.version }}.apk
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [version, windows, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Release notes from CHANGELOG.md
+        run: |
+          v="${{ needs.version.outputs.version }}"
+          # Section from the "## [<version>]" heading up to the next "## " heading
+          awk -v v="$v" 'f && /^## / {exit} f {print} /^## / && index($0, "[" v "]") {f=1}' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "LANTooth $v" > notes.md
+          cat notes.md
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" artifacts/* \
+            --title "LANTooth $GITHUB_REF_NAME" --notes-file notes.md

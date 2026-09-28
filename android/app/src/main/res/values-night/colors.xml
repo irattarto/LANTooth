@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- LANTooth brand palette (dark) — same roles as values/colors.xml -->
+    <color name="brand_primary">#AAC7FF</color>
+    <color name="brand_on_primary">#00315E</color>
+    <color name="brand_primary_container">#004587</color>
+    <color name="brand_on_primary_container">#DCE6FF</color>
+
+    <color name="brand_secondary_container">#2B3A55</color>
+    <color name="brand_on_secondary_container">#D6E3FF</color>
+
+    <color name="brand_surface">#111318</color>
+    <color name="brand_surface_variant">#2A2D33</color>
+    <color name="brand_on_surface">#E3E2E6</color>
+    <color name="brand_on_surface_variant">#C4C6D0</color>
+
+    <color name="status_connected">#7DDB93</color>
+
+</resources>

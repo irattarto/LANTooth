@@ -1,0 +1,58 @@
+# ── Android ───────────────────────────────────────────────────────────────────
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.kotlin/
+# CMake/NDK build tree (includes the fetched Opus sources)
+android/app/.cxx/
+*.apk
+*.aab
+
+# Keep .idea project config but not workspace/user state
+android/.idea/workspace.xml
+android/.idea/caches/
+android/.idea/deploymentTargetSelector.xml
+android/.idea/deviceManager.xml
+android/.idea/other.xml
+android/.idea/appInsightsSettings.xml
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.env
+
+# PyInstaller output (pc/build_exe.ps1)
+pc/build/
+pc/dist/
+
+# ── Native binaries ───────────────────────────────────────────────────────────
+# libopus DLL (64-bit; e.g. from VLC or MSYS2's mingw-w64-x86_64-opus) — kept
+# out of the repo, bundled into the exe by pc/build_exe.ps1
+pc/*.dll
+
+# Runtime state (identity, settings, log) lives in %APPDATA%\LANTooth, outside
+# the repo.
+
+# ── IDE / tools ───────────────────────────────────────────────────────────────
+.claude/
+.kilo/
+/.idea/
+.vscode/settings.json
+.vscode/*.code-workspace
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Android release signing (local only)
+android/keystore.properties
+*.jks
+*.keystore
+
+# JVM heap dumps from out-of-memory Gradle daemons
+*.hprof

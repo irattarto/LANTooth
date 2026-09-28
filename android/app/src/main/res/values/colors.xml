@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- LANTooth brand palette (light) — cool network blue -->
+    <color name="brand_primary">#2F6FED</color>
+    <color name="brand_on_primary">#FFFFFF</color>
+    <color name="brand_primary_container">#DCE6FF</color>
+    <color name="brand_on_primary_container">#001B44</color>
+
+    <color name="brand_secondary_container">#E7EFFF</color>
+    <color name="brand_on_secondary_container">#152E52</color>
+
+    <color name="brand_surface">#F7F9FF</color>
+    <color name="brand_surface_variant">#E1E5F0</color>
+    <color name="brand_on_surface">#1A1C1E</color>
+    <color name="brand_on_surface_variant">#44474E</color>
+
+    <color name="status_connected">#1E7D3B</color>
+
+</resources>
