@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Improved
+- PC: on first run the phone-mic output defaults to an installed virtual cable
+  (VB-CABLE, preferring its WASAPI entry) instead of System default.
+- PC: the hint under the phone-mic output names the exact microphone to select
+  in OBS/Discord/Zoom, and shows an orange warning when the mic goes to
+  speakers/System default, where other apps can't use it as a microphone.
+
 ## [0.1.0] — 2026-09-28
 
 First versioned release. Install **both** parts from this release: the PC and

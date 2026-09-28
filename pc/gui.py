@@ -315,22 +315,56 @@ class LanToothGUI:
         if saved_play and saved_play in play_labels:
             self.playback_combo.current(play_labels.index(saved_play))
         else:
-            self.playback_combo.current(0)
+            self.playback_combo.current(self._default_playback_index())
         self._update_playback_hint()
+
+    def _cable_indices(self) -> list[int]:
+        return [i for i, (_, _, is_cable) in enumerate(self.playback_options) if is_cable]
+
+    def _default_playback_index(self) -> int:
+        """First run (nothing saved): route the phone mic into a virtual cable if
+        one is installed — that's what makes it usable as a mic in OBS/Discord —
+        preferring its WASAPI entry. Otherwise System default."""
+        cables = self._cable_indices()
+        if not cables:
+            return 0
+        rank = {"Windows WASAPI": 0, "MME": 1, "Windows DirectSound": 2}
+        return min(cables, key=lambda i: rank.get(hostapi_name(self.playback_options[i][0]), 9))
+
+    @staticmethod
+    def _recording_side(playback_name: str) -> str:
+        """The recording device a virtual cable's playback end shows up as —
+        "CABLE Input (VB-Audio ...)" -> "CABLE Output (VB-Audio ...)"."""
+        return playback_name.replace("Input", "Output", 1) if "Input" in playback_name else playback_name
 
     def _update_playback_hint(self) -> None:
         i = self.playback_combo.current()
         if i < 0 or not self.playback_options:
             self.playback_hint_var.set("")
             return
-        _, _, is_cable = self.playback_options[i]
+        _, name, is_cable = self.playback_options[i]
+        later = "  (Applies on the next Connect.)" if self.worker.is_running() else ""
         if is_cable:
+            self.playback_hint_label.config(foreground="#888")
             self.playback_hint_var.set(
-                "Virtual cable: pick its matching *recording* device as your mic in Discord/Zoom/etc."
+                f"✓ Phone mic is available to other apps as the microphone "
+                f"“{self._recording_side(name)}” — select that in OBS/Discord/Zoom.{later}"
+            )
+            return
+
+        self.playback_hint_label.config(foreground="#B45309")
+        cables = self._cable_indices()
+        if cables:
+            cable = self.playback_options[self._default_playback_index()][1]
+            self.playback_hint_var.set(
+                f"⚠ The phone mic only plays on this device, so OBS/Discord/Zoom can't use it as a "
+                f"microphone. To use it as a mic, choose “{cable}” above.{later}"
             )
         else:
             self.playback_hint_var.set(
-                "Real speaker/headphone device: only YOU hear the phone's mic, other apps can't use it as a mic."
+                "⚠ The phone mic only plays on this device, so other apps can't use it as a microphone. "
+                "For that, install a virtual audio cable (e.g. VB-CABLE, vb-audio.com/Cable) and pick "
+                f"its “CABLE Input” here.{later}"
             )
 
     # -----------------------------------------------------------------
