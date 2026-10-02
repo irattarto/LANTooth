@@ -148,7 +148,8 @@ def stream_session(
             handle_control(cmd, val)
 
     stream = UDPStream(
-        session_key=session.session_key,
+        send_key=session.send_key,
+        recv_key=session.recv_key,
         our_stream_id=our_stream_id,
         their_stream_id=session.android_stream_id,
         on_audio=on_audio,

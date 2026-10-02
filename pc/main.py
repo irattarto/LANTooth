@@ -44,6 +44,12 @@ def _my_ips() -> list[str]:
     return ips or ["(unknown)"]
 
 
+def _confirm_code(code: str) -> bool:
+    print(f"\n  Pairing code: {code}")
+    answer = input("  Does your phone show exactly this code? [y/N]: ").strip().lower()
+    return answer in ("y", "yes")
+
+
 def _ask_ip() -> str:
     print("  (The phone's IP is shown on the LANTooth main screen.)")
     while True:
@@ -241,7 +247,7 @@ def main() -> None:
 
     identity_priv = load_or_create_identity()
     display_name = socket.gethostname()
-    client = ConnectClient()
+    client = ConnectClient(confirm=_confirm_code)
 
     try:
         # 1. Find Android, 2. audio source and destination — asked once; a

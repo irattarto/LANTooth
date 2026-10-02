@@ -20,7 +20,8 @@ The PC and phone apps must be the same version.
 
 1. Open LANTooth on the phone. Its IP address is shown on the main screen.
 2. On the PC, type that IP into LANTooth and press **Connect**.
-3. Accept the PC on the phone (only the first time).
+3. First time only: both screens show an 8-digit code. If it is identical on the
+   PC and the phone, confirm on both. Later connections are automatic.
 
 The PC remembers the phones it has connected to and reconnects to the last one
 at startup. Closing the PC window minimizes LANTooth to the tray; use **Quit**

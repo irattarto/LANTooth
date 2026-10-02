@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+Security hardening — **protocol v3**. PC and phone must be updated together; a
+v2 peer is refused with a version-mismatch message.
+
+### Changed
+- Both devices now have an identity key. The first time a PC and phone connect,
+  each shows the same 8-digit code; confirm they match on both (like Bluetooth
+  numeric comparison). Every later connection is automatic.
+- The phone is now authenticated to the PC (previously only the PC was), so a
+  device on the LAN can no longer pose as your phone.
+- A session only starts after the PC proves it holds its private key, so a
+  replayed connection request can no longer occupy or block the phone.
+- Separate encryption keys for each direction.
+- Phone: at most 3 pending pairing prompts, sanitized PC names, throttled
+  version-mismatch replies; new "Forget paired PCs" button.
+- Release APK no longer logs connection details; release workflow build jobs
+  are read-only.
+
 ## [0.1.1] — 2026-09-28
 
 PC-side improvement. The phone app is unchanged: 0.1.0 and 0.1.1 are fully

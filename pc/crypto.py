@@ -1,8 +1,13 @@
+import hashlib
+import hmac
 import logging
 import struct
+from dataclasses import dataclass
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
+
+from protocol import SESSION_KDF_SALT, SESSION_KDF_INFO, PAIRING_CODE_TAG, CONFIRM_TAG
 
 _log = logging.getLogger(__name__)
 
@@ -68,3 +73,48 @@ class AntiReplayWindow:
             self._max = counter
         else:
             self._bits |= 1 << (self._max - counter)
+
+
+# ── v3 handshake key schedule ────────────────────────────────────────────────
+
+@dataclass
+class SessionKeys:
+    pc_to_phone: bytes
+    phone_to_pc: bytes
+    confirm_key: bytes
+
+
+def _transcript(pc_id: bytes, pc_eph: bytes, ph_id: bytes, ph_eph: bytes) -> bytes:
+    return pc_id + pc_eph + ph_id + ph_eph
+
+
+def derive_session_keys(dh_ee: bytes, dh_es: bytes, dh_se: bytes, dh_ss: bytes,
+                        pc_id: bytes, pc_eph: bytes, ph_id: bytes, ph_eph: bytes) -> SessionKeys:
+    """dh_ee = DH(pc_eph, ph_eph), dh_es = DH(pc_id, ph_eph), dh_se = DH(pc_eph, ph_id),
+    dh_ss = DH(pc_id, ph_id) — both sides compute the same four values."""
+    okm = hkdf_derive(
+        dh_ee + dh_es + dh_se + dh_ss,
+        salt=SESSION_KDF_SALT,
+        info=SESSION_KDF_INFO + _transcript(pc_id, pc_eph, ph_id, ph_eph),
+        length=96,
+    )
+    return SessionKeys(okm[:32], okm[32:64], okm[64:])
+
+
+def confirm_mac(keys: SessionKeys, pc_id: bytes, pc_eph: bytes, ph_id: bytes, ph_eph: bytes) -> bytes:
+    return hmac.new(keys.confirm_key, CONFIRM_TAG + _transcript(pc_id, pc_eph, ph_id, ph_eph),
+                    hashlib.sha256).digest()
+
+
+def pairing_code(pc_id: bytes, pc_eph: bytes, ph_id: bytes, ph_eph: bytes) -> str:
+    """8-digit numeric-comparison code shown on both devices at first pairing. It
+    covers all four public keys, so a man-in-the-middle (who must substitute its
+    own keys on each leg) cannot make both devices show the same code except by
+    grinding ~10^8 key pairs inside the 30 s pairing window."""
+    digest = hashlib.sha256(PAIRING_CODE_TAG + _transcript(pc_id, pc_eph, ph_id, ph_eph)).digest()
+    n = int.from_bytes(digest[:8], "big") % 100_000_000
+    return f"{n:08d}"
+
+
+def format_code(code: str) -> str:
+    return f"{code[:4]} {code[4:]}"

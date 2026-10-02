@@ -2,8 +2,8 @@
 UDP audio/control streaming with ChaCha20-Poly1305 encryption and anti-replay protection.
 
 Each session has:
-  - Our outgoing stream: session_key, our_stream_id, monotonic send_counter
-  - Their incoming stream: session_key, their_stream_id (fixed after handshake), AntiReplayWindow
+  - Our outgoing stream: send_key, our_stream_id, monotonic send_counter
+  - Their incoming stream: recv_key, their_stream_id (fixed after handshake), AntiReplayWindow
 
 Nonce = stream_id(4B big-endian) || counter(8B big-endian) = 96 bits, never reused.
 """
@@ -23,14 +23,17 @@ from crypto import PacketCipher, AntiReplayWindow
 class UDPStream:
     def __init__(
         self,
-        session_key: bytes,
+        send_key: bytes,
+        recv_key: bytes,
         our_stream_id: int,
         their_stream_id: int,
         on_audio: Callable[[bytes], None],
         on_control: Callable[[bytes], None],
         sock: socket.socket,
     ):
-        self._cipher = PacketCipher(session_key)
+        # One key per direction, so the two sides' nonce spaces can never collide.
+        self._send_cipher = PacketCipher(send_key)
+        self._recv_cipher = PacketCipher(recv_key)
         self._our_stream_id = our_stream_id
         self._their_stream_id = their_stream_id
         self._on_audio = on_audio
@@ -75,7 +78,7 @@ class UDPStream:
         with self._send_lock:
             counter = self._send_counter
             self._send_counter += 1
-        ct = self._cipher.encrypt(self._our_stream_id, counter, ptype, plaintext)
+        ct = self._send_cipher.encrypt(self._our_stream_id, counter, ptype, plaintext)
         pkt = Packet(type=ptype, counter=counter, stream_id=self._our_stream_id, payload=ct)
         try:
             self._sock.sendto(pack_packet(pkt), self._peer)
@@ -107,7 +110,7 @@ class UDPStream:
             if not self._replay.check(pkt.counter):
                 continue
 
-            plaintext = self._cipher.decrypt(pkt.stream_id, pkt.counter, pkt.type, pkt.payload)
+            plaintext = self._recv_cipher.decrypt(pkt.stream_id, pkt.counter, pkt.type, pkt.payload)
             if plaintext is None:
                 continue
             # Only authenticated packets may advance the replay window.

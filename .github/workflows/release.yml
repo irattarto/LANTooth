@@ -16,8 +16,9 @@ on:
     tags: ["v*"]
   workflow_dispatch:   # manual dry run: builds everything, publishes nothing
 
+# Build jobs get read-only access; only the release job below may write.
 permissions:
-  contents: write
+  contents: read
 
 # GitHub occasionally starts two runs for one tag push; queue them instead of
 # letting both race to create the same release.
@@ -122,6 +123,8 @@ jobs:
     if: github.ref_type == 'tag'
     needs: [version, windows, android]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
 
@@ -131,8 +134,10 @@ jobs:
           merge-multiple: true
 
       - name: Release notes from CHANGELOG.md
+        env:
+          VERSION_OUT: ${{ needs.version.outputs.version }}
         run: |
-          v="${{ needs.version.outputs.version }}"
+          v="$VERSION_OUT"
           # Section from the "## [<version>]" heading up to the next "## " heading
           awk -v v="$v" 'f && /^## / {exit} f {print} /^## / && index($0, "[" v "]") {f=1}' CHANGELOG.md > notes.md
           [ -s notes.md ] || echo "LANTooth $v" > notes.md
