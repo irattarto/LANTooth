@@ -53,7 +53,7 @@ private const val TOS_EF = 0xB8
 
 enum class StreamMode { HEADSET, MIC_ONLY }
 
-data class PendingConnectRequest(val name: String, val ip: String, val idHex: String)
+data class PendingConnectRequest(val name: String, val ip: String, val idHex: String, val code: String)
 
 /**
  * Persistent foreground service. Android is the server: binds UDP port 7890,
@@ -116,7 +116,9 @@ class StreamService : Service() {
     private var audioSocket: DatagramSocket? = null
 
     // Streaming session state
+    // sessionKey is the phone -> PC key (null = no session); recvKey the PC -> phone key.
     @Volatile private var sessionKey: ByteArray? = null
+    @Volatile private var recvKey: ByteArray? = null
     @Volatile private var pcIp: String = ""
     @Volatile private var pcAddr: InetAddress? = null
     @Volatile private var pcAudioPort: Int = 0
@@ -257,7 +259,7 @@ class StreamService : Service() {
                 ourAudioPort = sock.localPort,
                 ourStreamId = ourStreamId,
                 timeoutMs = 120_000,
-                onConnectRequest = { name, ip, idHex -> handleConnectRequest(name, ip, idHex) },
+                onConnectRequest = { name, ip, idHex, code -> handleConnectRequest(name, ip, idHex, code) },
                 onVersionMismatch = { name, _, theirVersion ->
                     updateNotification("Rejected $name: v$theirVersion ≠ v${Protocol.PROTOCOL_VERSION} — update both apps")
                 },
@@ -273,7 +275,8 @@ class StreamService : Service() {
             val decoder = Codec.Decoder(session.mediaChannels)
             val jb = JitterBuffer(decoder)
             jitterBuffer = jb
-            sessionKey = session.sessionKey
+            recvKey = session.recvKey
+            sessionKey = session.sendKey
 
             acquireLocks()
             isConnected = true
@@ -291,6 +294,7 @@ class StreamService : Service() {
 
             Log.d(TAG, "Disconnected from ${session.pcIp} (${playbackStats(jb)})")
             sessionKey = null
+            recvKey = null
             jitterBuffer = null
             audio.stopPlayback()  // playback thread must be gone before the decoder is freed
             decoder.close()
@@ -381,7 +385,7 @@ class StreamService : Service() {
 
         try {
             while (true) {
-                val key = sessionKey ?: break
+                if (sessionKey == null) break
                 if (System.currentTimeMillis() - lastRecvAtMs > LIVENESS_TIMEOUT_MS) {
                     Log.w(TAG, "No traffic from PC for ${LIVENESS_TIMEOUT_MS}ms — treating as disconnected")
                     sessionKey = null
@@ -396,7 +400,7 @@ class StreamService : Service() {
                     if (pkt.streamId != theirStreamId) continue
                     if (!replayWindow.check(pkt.counter)) continue
                     val plain = CryptoEngine.decryptPacket(
-                        key, pkt.streamId, pkt.counter, pkt.type, pkt.payload
+                        recvKey ?: break, pkt.streamId, pkt.counter, pkt.type, pkt.payload
                     ) ?: continue
                     // Only authenticated packets may advance the replay window or
                     // count as liveness.
@@ -481,6 +485,14 @@ class StreamService : Service() {
         setMicActive(false)
     }
 
+    /** Revokes every paired PC: each has to go through the pairing-code step again. */
+    fun forgetPairedPcs() {
+        disconnectSession()
+        pairingManager.pairedDevices().forEach { pairingManager.forgetDevice(it.first) }
+    }
+
+    fun pairedPcCount(): Int = pairingManager.pairedDevices().size
+
     fun setMicActive(active: Boolean) {
         micActive = active
         mediaCtrl.setMicActive(active)
@@ -538,11 +550,11 @@ class StreamService : Service() {
     // Connect-request Accept/Reject
     // ---------------------------------------------------------------------------
 
-    private fun handleConnectRequest(name: String, ip: String, idHex: String) {
-        val req = PendingConnectRequest(name, ip, idHex)
+    private fun handleConnectRequest(name: String, ip: String, idHex: String, code: String) {
+        val req = PendingConnectRequest(name, ip, idHex, code)
         pendingRequest = req
         onPendingConnectRequest?.invoke(req)
-        showConnectRequestNotification(name, ip, idHex)
+        showConnectRequestNotification(name, ip, idHex, code)
     }
 
     /** In-app fallback for when the notification is missed/swiped — mirrors the notification actions. */
@@ -562,7 +574,7 @@ class StreamService : Service() {
         (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).cancel(idHex.hashCode())
     }
 
-    private fun showConnectRequestNotification(name: String, ip: String, idHex: String) {
+    private fun showConnectRequestNotification(name: String, ip: String, idHex: String, code: String) {
         val acceptIntent = Intent(this, StreamService::class.java).apply {
             action = ACTION_CONNECT_ACCEPT
             putExtra(EXTRA_ID_HEX, idHex)
@@ -583,7 +595,7 @@ class StreamService : Service() {
         val notification = NotificationCompat.Builder(this, CONNECT_CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_add)
             .setContentTitle("Connect to $name?")
-            .setContentText(ip)
+            .setContentText("Code $code — only Accept if your PC shows the same code ($ip)")
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setAutoCancel(true)

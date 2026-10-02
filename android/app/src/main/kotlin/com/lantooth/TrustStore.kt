@@ -21,4 +21,17 @@ class TrustStore(context: Context) {
             .putString("ip_$idHex", ip)
             .apply()
     }
+
+    /** Paired PCs as (idHex, name), for a "forget device" list. */
+    fun list(): List<Pair<String, String>> =
+        prefs.all.keys.filter { it.startsWith("name_") }
+            .map { it.removePrefix("name_") to (prefs.getString(it, "") ?: "") }
+
+    fun forget(idHex: String) {
+        prefs.edit().remove("name_$idHex").remove("ip_$idHex").apply()
+    }
+
+    fun forgetAll() {
+        prefs.edit().clear().apply()
+    }
 }

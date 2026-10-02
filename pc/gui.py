@@ -39,7 +39,7 @@ from session import (
 _log = logging.getLogger("lantooth.gui")
 
 RECONNECT_DELAY_S = 5.0
-CONNECT_ATTEMPT_TIMEOUT_S = 15.0
+CONNECT_ATTEMPT_TIMEOUT_S = 45.0   # first pairing needs time to compare the code on both devices
 SYSTEM_DEFAULT_PLAYBACK_LABEL = "System default (monitor only)"
 _ICON_FILE = "lantooth_icon.png"
 
@@ -81,8 +81,11 @@ class StreamWorker:
         self._thread: threading.Thread | None = None
         self._identity_priv = load_or_create_identity()
         self._display_name = socket.gethostname()
-        self._client = ConnectClient()
+        self._client = ConnectClient(confirm=self._ask_pairing_code)
         self.generation = 0
+        self._confirm_answer: bool | None = None
+        self._confirm_ready = threading.Event()
+        self._gen_now = 0
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
@@ -95,6 +98,7 @@ class StreamWorker:
             return False
         self._stop.clear()
         self.generation += 1
+        self._gen_now = self.generation
         self._thread = threading.Thread(
             target=self._run,
             args=(self.generation, android_ip, capture_backend, capture_device,
@@ -107,6 +111,21 @@ class StreamWorker:
 
     def stop(self) -> None:
         self._stop.set()
+
+    def _ask_pairing_code(self, code: str) -> bool:
+        """Called on the worker thread at first pairing: has the GUI thread ask the
+        user whether `code` matches the one on the phone, and waits for the answer."""
+        self._confirm_answer = None
+        self._confirm_ready.clear()
+        self._q.put(("confirm", code, self._gen_now))
+        while not self._confirm_ready.wait(0.25):
+            if self._stop.is_set():
+                raise ConnectCancelled()
+        return bool(self._confirm_answer)
+
+    def answer_pairing(self, ok: bool) -> None:
+        self._confirm_answer = ok
+        self._confirm_ready.set()
 
     def join(self, timeout: float) -> None:
         if self._thread is not None:
@@ -449,6 +468,15 @@ class LanToothGUI:
                 if kind == "connected":
                     remember_ip(self.cfg, text)
                     self.ip_combo["values"] = self.cfg["recent_ips"]
+                elif kind == "confirm":
+                    self._show_window()
+                    ok = messagebox.askyesno(
+                        "Pair with phone",
+                        f"Your phone should now show this code:\n\n        {text}\n\n"
+                        "Does it match exactly?\n(Only say Yes if you started this connection and the codes are identical.)",
+                        parent=self.root,
+                    )
+                    self.worker.answer_pairing(ok)
                 elif kind == "status":
                     self.status_var.set(text)
                 elif kind == "stats":

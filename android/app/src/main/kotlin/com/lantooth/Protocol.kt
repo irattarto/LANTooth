@@ -32,24 +32,33 @@ object Protocol {
     //   v1: 20ms Opus frames, payload = seq + opus
     //   v2: identity-authenticated session key, payload carries a redundant copy
     //       of the previous frame, stereo-capable PC -> phone stream
-    const val PROTOCOL_VERSION: Int = 2
+    //   v3: mutual identity authentication (the phone has an identity key too), a
+    //       first-pairing numeric-comparison code, separate PC->phone / phone->PC
+    //       keys, and a CONNECT_CONFIRM proof so a session only starts for a peer
+    //       that really holds the trusted identity's private key
+    const val PROTOCOL_VERSION: Int = 3
 
-    // Connect handshake (Bluetooth-style: on-device Accept/Reject, no PIN)
-    val CONNECT_REQ    = "CONNECT_REQ".toByteArray(Charsets.US_ASCII)
-    val CONNECT_ACCEPT = "CONNECT_ACCEPT".toByteArray(Charsets.US_ASCII)
-    val CONNECT_REJECT = "CONNECT_REJECT".toByteArray(Charsets.US_ASCII)
+    // Connect handshake (Bluetooth-style numeric comparison on first pairing, then automatic)
+    val CONNECT_REQ     = "CONNECT_REQ".toByteArray(Charsets.US_ASCII)
+    val CONNECT_PENDING = "CONNECT_PENDING".toByteArray(Charsets.US_ASCII)  // phone -> PC: waiting for the user, carries keys for the code
+    val CONNECT_ACCEPT  = "CONNECT_ACCEPT".toByteArray(Charsets.US_ASCII)
+    val CONNECT_REJECT  = "CONNECT_REJECT".toByteArray(Charsets.US_ASCII)
+    val CONNECT_CONFIRM = "CONNECT_CONFIRM".toByteArray(Charsets.US_ASCII)  // PC -> phone: proof of the session key
+    val CONNECT_CANCEL  = "CONNECT_CANCEL".toByteArray(Charsets.US_ASCII)   // PC -> phone: user declined the code
 
     // CONNECT_REJECT body reason codes: 1B reason + 1B responder's PROTOCOL_VERSION
     const val REJECT_REASON_USER: Byte             = 0  // user tapped Reject on Android
     const val REJECT_REASON_VERSION_MISMATCH: Byte = 1  // auto-rejected before any user prompt
 
-    // HKDF parameters for deriving the session key. v2 input keying material is
-    //   X25519(pc_eph, android_eph) || X25519(pc_identity, android_eph)
-    // — the second term means only the holder of the trusted identity's PRIVATE
-    // key can derive the session key (v1 used only the ephemeral pair, so a
-    // replayed identity public key was enough to impersonate a trusted PC).
-    val SESSION_KDF_SALT = "lantooth-connect-v2".toByteArray(Charsets.US_ASCII)
-    val SESSION_KDF_INFO = "lantooth-session-v2".toByteArray(Charsets.US_ASCII)
+    // HKDF parameters. Input keying material is four DH results,
+    //   X25519(pc_eph, ph_eph) || X25519(pc_id, ph_eph) || X25519(pc_eph, ph_id) || X25519(pc_id, ph_id)
+    // so only a peer holding BOTH private identity keys can derive the session keys.
+    // The transcript (all four public keys) is bound into the HKDF info; 96 bytes are
+    // produced: PC->phone key, phone->PC key, confirmation key.
+    val SESSION_KDF_SALT = "lantooth-connect-v3".toByteArray(Charsets.US_ASCII)
+    val SESSION_KDF_INFO = "lantooth-session-v3".toByteArray(Charsets.US_ASCII)
+    val PAIRING_CODE_TAG = "lantooth-pair-v3".toByteArray(Charsets.US_ASCII)
+    val CONFIRM_TAG      = "lantooth-confirm-v3".toByteArray(Charsets.US_ASCII)
 
     // Audio payload (inside the encrypted packet):
     //   [ 4B seq | 2B cur_len | cur Opus frame | previous Opus frame (optional) ]

@@ -51,6 +51,16 @@ class MainActivity : AppCompatActivity() {
             binding.btnRejectRequest.setOnClickListener { streamService?.rejectPendingRequest() }
 
             binding.btnToggleService.text = "Stop Service"
+
+            binding.btnForgetPcs.setOnClickListener {
+                val n = svc.pairedPcCount()
+                androidx.appcompat.app.AlertDialog.Builder(this@MainActivity)
+                    .setTitle("Forget paired PCs?")
+                    .setMessage("$n paired PC(s) will be removed and must be paired again with a new code.")
+                    .setPositiveButton("Forget") { _, _ -> svc.forgetPairedPcs() }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            }
         }
 
         override fun onServiceDisconnected(name: ComponentName) {
@@ -137,7 +147,7 @@ class MainActivity : AppCompatActivity() {
         if (req == null) {
             binding.pendingRequestGroup.visibility = android.view.View.GONE
         } else {
-            binding.tvPendingRequest.text = "${req.name} (${req.ip}) wants to connect"
+            binding.tvPendingRequest.text = "${req.name} (${req.ip}) wants to connect\n\nCode: ${req.code}\nAccept only if your PC shows the same code."
             binding.pendingRequestGroup.visibility = android.view.View.VISIBLE
         }
     }

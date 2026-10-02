@@ -4,7 +4,9 @@ import com.google.crypto.tink.subtle.Hkdf
 import com.google.crypto.tink.subtle.X25519
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.MessageDigest
 import javax.crypto.Cipher
+import javax.crypto.Mac
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
@@ -16,6 +18,46 @@ object CryptoEngine {
 
     fun hkdfDerive(ikm: ByteArray, salt: ByteArray, info: ByteArray, length: Int = 32): ByteArray =
         Hkdf.computeHkdf("HmacSHA256", ikm, salt, info, length)
+
+    // ---------------------------------------------------------------------------
+    // v3 handshake key schedule (mirrors pc/crypto.py)
+    // ---------------------------------------------------------------------------
+
+    class SessionKeys(val pcToPhone: ByteArray, val phoneToPc: ByteArray, val confirmKey: ByteArray)
+
+    private fun transcript(pcId: ByteArray, pcEph: ByteArray, phId: ByteArray, phEph: ByteArray) =
+        pcId + pcEph + phId + phEph
+
+    /** Phone side: ph* are our keys, pc* the PC's. Throws on a low-order / invalid public key. */
+    fun deriveSessionKeys(
+        phIdPriv: ByteArray, phEphPriv: ByteArray,
+        pcId: ByteArray, pcEph: ByteArray, phId: ByteArray, phEph: ByteArray,
+    ): SessionKeys {
+        val ee = x25519SharedSecret(phEphPriv, pcEph)   // DH(pc_eph, ph_eph)
+        val es = x25519SharedSecret(phEphPriv, pcId)    // DH(pc_id,  ph_eph)
+        val se = x25519SharedSecret(phIdPriv, pcEph)    // DH(pc_eph, ph_id)
+        val ss = x25519SharedSecret(phIdPriv, pcId)     // DH(pc_id,  ph_id)
+        val okm = hkdfDerive(
+            ee + es + se + ss, Protocol.SESSION_KDF_SALT,
+            Protocol.SESSION_KDF_INFO + transcript(pcId, pcEph, phId, phEph), 96,
+        )
+        return SessionKeys(okm.copyOfRange(0, 32), okm.copyOfRange(32, 64), okm.copyOfRange(64, 96))
+    }
+
+    fun confirmMac(keys: SessionKeys, pcId: ByteArray, pcEph: ByteArray, phId: ByteArray, phEph: ByteArray): ByteArray {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(keys.confirmKey, "HmacSHA256"))
+        return mac.doFinal(Protocol.CONFIRM_TAG + transcript(pcId, pcEph, phId, phEph))
+    }
+
+    /** 8-digit numeric-comparison code, "1234 5678" — identical to the PC's. */
+    fun pairingCode(pcId: ByteArray, pcEph: ByteArray, phId: ByteArray, phEph: ByteArray): String {
+        val d = MessageDigest.getInstance("SHA-256").digest(Protocol.PAIRING_CODE_TAG + transcript(pcId, pcEph, phId, phEph))
+        var n = 0L
+        for (i in 0 until 8) n = (n shl 8) or (d[i].toLong() and 0xFF)
+        val code = java.lang.Long.remainderUnsigned(n, 100_000_000L).toString().padStart(8, '0')
+        return code.substring(0, 4) + " " + code.substring(4)
+    }
 
     // ---------------------------------------------------------------------------
     // X25519 ephemeral key exchange (via Tink)

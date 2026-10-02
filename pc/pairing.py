@@ -1,51 +1,54 @@
 """
-Connect handshake for LANTooth PC (client role) — Bluetooth-style, no PIN.
+Connect handshake for LANTooth PC (client role) — Bluetooth-style numeric
+comparison on first pairing, automatic afterwards (protocol v3).
 
-PC is the initiator: sends CONNECT_REQ carrying its persistent identity public
-key (a device-address-like identifier), a fresh ephemeral public key, and its
-PROTOCOL_VERSION. Android auto-rejects a version mismatch before any user
-prompt; otherwise it shows an on-device Accept/Reject prompt for unrecognized
-identities (skipped automatically for already-trusted ones), then replies:
+Both devices have a persistent X25519 identity key. PC is the initiator:
 
-  CONNECT_REQ:    identity_pub(32B) + ephemeral_pub(32B) + pc_audio_port(2B) +
-                  pc_stream_id(4B) + protocol_version(1B) + name_len(1B) + name +
-                  media_channels(1B)
-  CONNECT_ACCEPT: android_ephemeral_pub(32B) + android_audio_port(2B) + android_stream_id(4B)
-  CONNECT_REJECT: reason(1B) + android_protocol_version(1B)
+  CONNECT_REQ:     identity_pub(32) + ephemeral_pub(32) + pc_audio_port(2) +
+                   pc_stream_id(4) + protocol_version(1) + name_len(1) + name +
+                   media_channels(1)
+  CONNECT_PENDING: phone_identity_pub(32) + phone_ephemeral_pub(32)
+                   (phone is waiting for its user to accept an unknown PC)
+  CONNECT_ACCEPT:  phone_ephemeral_pub(32) + phone_audio_port(2) +
+                   phone_stream_id(4) + phone_identity_pub(32)
+  CONNECT_REJECT:  reason(1B) + phone_protocol_version(1B)
+  CONNECT_CONFIRM: pc_ephemeral_pub(32) + HMAC(confirm_key, transcript)  (several copies)
+  CONNECT_CANCEL:  pc_ephemeral_pub(32)  (user declined the code)
 
-(protocol_version sits at the same offset as in v1, and media_channels goes
-after the name, so an older phone can still parse the request far enough to
-send a proper version-mismatch reject.)
+If the phone's identity is not pinned on this PC yet, an 8-digit code derived
+from all four public keys is shown here and on the phone; the user confirms they
+match and the PC pins the phone's identity. From then on the phone is
+recognised automatically, and anyone else answering at its IP is refused.
 
-Both sides then derive:
-  session_key = HKDF(X25519(pc_eph, android_eph) || X25519(pc_identity, android_eph),
-                     salt=SESSION_KDF_SALT, info=SESSION_KDF_INFO)
-
-The second DH term binds the key to the identity's private key: a trusted PC's
-identity public key is visible in any CONNECT_REQ on the LAN, so without it
-anyone could replay that public key and be auto-accepted. The handshake itself
-carries nothing secret, so it travels as plaintext UDP.
+Session keys come from four DH results (see crypto.derive_session_keys), so only
+the real phone and the real PC can derive them. The phone starts the session only
+after a valid CONNECT_CONFIRM, so a replayed CONNECT_REQ cannot occupy it.
+The handshake itself carries nothing secret, so it travels as plaintext UDP.
 """
+
 
 import socket
 import struct
 import threading
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey, X25519PublicKey,
 )
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from crypto import hkdf_derive
+from crypto import derive_session_keys, confirm_mac, pairing_code, format_code
+from phones import PhoneTrustStore
 from protocol import (
-    CONNECT_REQ, CONNECT_ACCEPT, CONNECT_REJECT,
-    SESSION_KDF_SALT, SESSION_KDF_INFO,
+    CONNECT_REQ, CONNECT_PENDING, CONNECT_ACCEPT, CONNECT_REJECT, CONNECT_CONFIRM, CONNECT_CANCEL,
     PROTOCOL_VERSION, REJECT_REASON_VERSION_MISMATCH,
 )
 
 RESEND_INTERVAL_S = 2.0
+CONFIRM_COPIES = 5          # UDP: a few copies so one lost datagram can't stall the session
+CONFIRM_SPACING_S = 0.05
 _POLL_S = 0.25  # how quickly a stop request is noticed
 
 
@@ -55,17 +58,40 @@ class ConnectCancelled(Exception):
 
 @dataclass
 class SessionResult:
-    session_key: bytes
+    send_key: bytes        # PC -> phone
+    recv_key: bytes        # phone -> PC
     android_audio_port: int
     android_stream_id: int
 
 
-def derive_session_key(dh_ephemeral: bytes, dh_identity: bytes) -> bytes:
-    return hkdf_derive(dh_ephemeral + dh_identity, salt=SESSION_KDF_SALT, info=SESSION_KDF_INFO)
+def _raw(pub) -> bytes:
+    return pub.public_bytes(Encoding.Raw, PublicFormat.Raw)
 
 
 class ConnectClient:
-    """Handles the client-side connect handshake (PC → Android)."""
+    """Handles the client-side connect handshake (PC → Android).
+
+    `confirm(code)` is called (from the connecting thread) when an unpinned phone
+    must be verified; it returns True if the user says the code matches the one
+    on the phone. It may raise ConnectCancelled.
+    """
+
+    def __init__(self, trust: PhoneTrustStore | None = None,
+                 confirm: Callable[[str], bool] | None = None):
+        self._trust = trust if trust is not None else PhoneTrustStore()
+        self._confirm = confirm
+
+    def _ensure_pinned(self, sock, addr, pc_id, pc_eph, ph_id, ph_eph) -> None:
+        if self._trust.is_pinned(ph_id):
+            return
+        code = pairing_code(pc_id, pc_eph, ph_id, ph_eph)
+        if self._confirm is None or not self._confirm(format_code(code)):
+            try:
+                sock.sendto(CONNECT_CANCEL + pc_eph, addr)
+            except OSError:
+                pass
+            raise RuntimeError("Pairing declined — the codes did not match")
+        self._trust.pin(ph_id)
 
     def connect(
         self,
@@ -82,22 +108,22 @@ class ConnectClient:
         """
         Send CONNECT_REQ, resending every ~2s, until Android accepts, rejects,
         `timeout` seconds elapse, or stop_event is set. Raises RuntimeError on
-        reject/timeout and ConnectCancelled on stop.
+        reject/timeout/declined pairing and ConnectCancelled on stop.
         """
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(_POLL_S)
         try:
             addr = (host, port)
 
-            identity_pub = identity_priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+            pc_id = _raw(identity_priv.public_key())
             eph_priv = X25519PrivateKey.generate()
-            eph_pub = eph_priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+            pc_eph = _raw(eph_priv.public_key())
 
             name_bytes = display_name.encode("utf-8")[:64]
             req = (
                 CONNECT_REQ
-                + identity_pub
-                + eph_pub
+                + pc_id
+                + pc_eph
                 + struct.pack("!HIBB", our_audio_port, our_stream_id, PROTOCOL_VERSION, len(name_bytes))
                 + name_bytes
                 + struct.pack("!B", media_channels)
@@ -133,18 +159,40 @@ class ConnectClient:
                         )
                     raise RuntimeError("Connection rejected on Android")
 
+                if data.startswith(CONNECT_PENDING):
+                    body = data[len(CONNECT_PENDING):]
+                    if len(body) < 64:
+                        continue
+                    self._ensure_pinned(sock, addr, pc_id, pc_eph, body[:32], body[32:64])
+                    # The user may have taken a while over the code dialog.
+                    deadline = max(deadline, time.monotonic() + timeout)
+                    continue
+
                 if data.startswith(CONNECT_ACCEPT):
                     body = data[len(CONNECT_ACCEPT):]
-                    if len(body) < 38:
+                    if len(body) < 70:
                         continue
-                    android_eph = X25519PublicKey.from_public_bytes(body[:32])
+                    ph_eph_raw = body[:32]
                     android_audio_port, android_stream_id = struct.unpack_from("!HI", body, 32)
+                    ph_id = body[38:70]
+                    try:
+                        ph_eph = X25519PublicKey.from_public_bytes(ph_eph_raw)
+                        ph_id_key = X25519PublicKey.from_public_bytes(ph_id)
+                        keys = derive_session_keys(
+                            eph_priv.exchange(ph_eph), identity_priv.exchange(ph_eph),
+                            eph_priv.exchange(ph_id_key), identity_priv.exchange(ph_id_key),
+                            pc_id, pc_eph, ph_id, ph_eph_raw,
+                        )
+                    except ValueError:
+                        continue  # bad / low-order key from a spoofed packet
+                    self._ensure_pinned(sock, addr, pc_id, pc_eph, ph_id, ph_eph_raw)
 
-                    session_key = derive_session_key(
-                        eph_priv.exchange(android_eph),
-                        identity_priv.exchange(android_eph),
-                    )
-                    return SessionResult(session_key, android_audio_port, android_stream_id)
+                    confirm = CONNECT_CONFIRM + pc_eph + confirm_mac(keys, pc_id, pc_eph, ph_id, ph_eph_raw)
+                    for _ in range(CONFIRM_COPIES):
+                        sock.sendto(confirm, addr)
+                        time.sleep(CONFIRM_SPACING_S)
+                    return SessionResult(keys.pc_to_phone, keys.phone_to_pc,
+                                         android_audio_port, android_stream_id)
 
             raise RuntimeError("Timed out waiting for you to accept the connection on Android")
         finally:
