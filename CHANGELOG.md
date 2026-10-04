@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.1] — 2026-10-04 (test release)
+
+Fixes for pairing in 0.2.0, where one device could show a code the other didn't.
+- Phone: PCs trusted by older versions (granted without a code) are dropped, so
+  they pair again with the code on both devices.
+- PC: always compares the code when the phone shows one, even if it still has
+  the phone pinned (e.g. after "Forget paired PCs" on the phone).
+- PC that no longer knows a phone now tells it (authenticated) to forget the PC,
+  so the code appears on both sides.
+
 ## [0.2.0] — 2026-10-04 (test release)
 
 Security hardening — **protocol v4**. PC and phone must be updated together; an
