@@ -296,6 +296,12 @@ def test_handshake() -> None:
     res, ph, err = _handshake(pc, phone_id, trust, yes)
     check(err is None and not shown, "second connection to the pinned phone needs no prompt")
 
+    # Phone forgot this PC (answers PENDING) while the PC still has it pinned: the code must be compared again.
+    shown.clear()
+    res, ph, err = _handshake(pc, phone_id, trust, yes, pending=True)
+    check(err is None and len(shown) == 1 and shown[0].replace(" ", "") == ph["code"],
+          "phone that re-pairs shows a code and the PC asks about it, even though it was pinned")
+
     res, ph, err = _handshake(pc, X25519PrivateKey.generate(), trust, lambda c: False, pending=True)
     check(res is None and err is not None and ph.get("cancelled"), "different phone at the same IP is refused when the code is declined")
 

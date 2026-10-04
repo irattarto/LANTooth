@@ -92,8 +92,11 @@ class ConnectClient:
         self._trust = trust if trust is not None else PhoneTrustStore()
         self._confirm = confirm
 
-    def _ensure_pinned(self, sock, addr, pc_id, pc_eph, ph_id, ph_eph) -> None:
-        if self._trust.is_pinned(ph_id):
+    def _ensure_pinned(self, sock, addr, pc_id, pc_eph, ph_id, ph_eph, force: bool = False) -> None:
+        # `force`: the phone answered PENDING, i.e. it does not know this PC and is
+        # showing a code — compare it even if we still have the phone pinned (it was
+        # re-paired or "forgot" us), otherwise the phone shows a code we never ask about.
+        if self._trust.is_pinned(ph_id) and not force:
             return
         code = pairing_code(pc_id, pc_eph, ph_id, ph_eph)
         if self._confirm is None or not self._confirm(format_code(code)):
@@ -143,6 +146,7 @@ class ConnectClient:
             # ph_eph -> (keys, ph_id, android port, android stream id) for every offer we
             # answered with CONFIRM; a READY proof from the real phone completes one.
             offers: dict[bytes, tuple] = {}
+            confirmed: set[bytes] = set()   # (phone id || phone eph) pairs whose code the user already approved
 
             deadline = time.monotonic() + timeout
             next_send = 0.0
@@ -180,7 +184,9 @@ class ConnectClient:
                         continue
                     # Open the commitment now that the phone's keys are known.
                     sock.sendto(CONNECT_REVEAL + pc_eph, addr)
-                    self._ensure_pinned(sock, addr, pc_id, pc_eph, body[:32], body[32:64])
+                    if body[:64] not in confirmed:     # the phone resends PENDING with every REQ
+                        self._ensure_pinned(sock, addr, pc_id, pc_eph, body[:32], body[32:64], force=True)
+                        confirmed.add(body[:64])
                     # The user may have taken a while over the code dialog.
                     deadline = max(deadline, time.monotonic() + timeout)
                     continue
