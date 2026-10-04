@@ -127,6 +127,9 @@ class StreamWorker:
         self._confirm_answer = ok
         self._confirm_ready.set()
 
+    def forget_phones(self) -> None:
+        self._client.forget_all_phones()
+
     def join(self, timeout: float) -> None:
         if self._thread is not None:
             self._thread.join(timeout)
@@ -250,6 +253,7 @@ class LanToothGUI:
                                      values=self.cfg.get("recent_ips", []))
         self.ip_combo.pack(side="left", fill="x", expand=True)
         ttk.Button(ip_row, text="Forget", width=8, command=self._forget_ip).pack(side="left", padx=(6, 0))
+        ttk.Button(ip_row, text="Unpair phones", width=14, command=self._unpair_phones).pack(side="left", padx=(6, 0))
 
         ttk.Label(frm, text="PC → Phone  (your audio to send):").grid(row=1, column=0, sticky="w", **pad)
         self.capture_combo = ttk.Combobox(frm, state="readonly", width=46)
@@ -450,6 +454,18 @@ class LanToothGUI:
             self.ip_combo["values"] = self.cfg["recent_ips"]
             self.ip_var.set("")
             self.status_var.set(f"Forgot {ip}")
+
+    def _unpair_phones(self) -> None:
+        if self.worker.is_running():
+            messagebox.showinfo("LANTooth", "Disconnect first, then unpair.")
+            return
+        if messagebox.askyesno(
+            "Unpair phones",
+            "Forget every phone paired with this PC?\n\nThe next connection will show a "
+            "pairing code on the PC and the phone, and you must confirm they match.",
+        ):
+            self.worker.forget_phones()
+            self.status_var.set("All phones unpaired — the next connection needs a pairing code")
 
     def _stop_worker(self) -> None:
         if not self.worker.is_running():

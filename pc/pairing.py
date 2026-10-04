@@ -93,6 +93,10 @@ class ConnectClient:
         self._trust = trust if trust is not None else PhoneTrustStore()
         self._confirm = confirm
 
+    def forget_all_phones(self) -> None:
+        """Un-pin every phone: each must be paired again with the code on both devices."""
+        self._trust.forget_all()
+
     def _ensure_pinned(self, sock, addr, pc_id, pc_eph, ph_id, ph_eph, force: bool = False) -> None:
         # `force`: the phone answered PENDING, i.e. it does not know this PC and is
         # showing a code — compare it even if we still have the phone pinned (it was
