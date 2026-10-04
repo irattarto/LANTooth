@@ -7,6 +7,9 @@ libopus search order (first hit wins):
   4. System PATH                                 — last: PATH entries are often
                                                    user-writable, so least trusted
 
+The frozen exe uses only (1): it ships its own opus.dll, so it never loads a
+libopus from VLC or PATH, where a planted DLL would run inside the app.
+
 The DLL is loaded lazily (first Encoder/Decoder), so a missing libopus surfaces
 as a normal session error instead of crashing the app at import time.
 
@@ -37,13 +40,17 @@ def frame_bytes(channels: int) -> int:
 _DLL_NAMES = ("opus.dll", "libopus-0.dll", "libopus.dll")
 
 
+_FROZEN = getattr(sys, "frozen", False)
+
+
 def _candidate_dirs() -> list[str]:
     dirs: list[str] = []
-    if getattr(sys, "frozen", False):
+    if _FROZEN:
         bundle = getattr(sys, "_MEIPASS", None)
         if bundle:
             dirs.append(bundle)
         dirs.append(os.path.dirname(sys.executable))
+        return dirs
     dirs.append(os.path.dirname(os.path.abspath(__file__)))
     dirs.append(r"C:\Program Files\VideoLAN\VLC")
     dirs.append(r"C:\Program Files (x86)\VideoLAN\VLC")
@@ -63,7 +70,7 @@ def _load_libopus() -> ctypes.CDLL:
             except OSError:
                 continue
 
-    for name in ("opus", "libopus-0", "libopus"):
+    for name in () if _FROZEN else ("opus", "libopus-0", "libopus"):
         found = ctypes.util.find_library(name)
         if found:
             try:

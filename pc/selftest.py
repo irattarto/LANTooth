@@ -5,7 +5,7 @@ Offline self-tests for the PC side — no phone or audio device needed.
 
 Covers the replay window, audio payload framing, the libopus round-trip, the
 jitter buffer under simulated Wi-Fi jitter/loss/bursts/talk-spurt gaps, the
-streaming resampler's quality, and the v3 connect handshake (against an
+streaming resampler's quality, and the v4 connect handshake (against an
 in-process fake phone: pairing code, pinning, impersonation attempts).
 """
 
@@ -23,10 +23,11 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 import codec
 from audio_engine import _FrameChunker, _downmix
-from crypto import AntiReplayWindow, derive_session_keys, confirm_mac, pairing_code
+from crypto import AntiReplayWindow, derive_session_keys, confirm_mac, ready_mac, commitment, pairing_code
 from jitter_buffer import JitterBuffer, FRAME_S
 from pairing import ConnectClient
-from protocol import CONNECT_REQ, CONNECT_ACCEPT, CONNECT_CONFIRM, CONNECT_CANCEL, pack_audio, unpack_audio, MAX_AUDIO_PAYLOAD
+from protocol import (CONNECT_REQ, CONNECT_PENDING, CONNECT_REVEAL, CONNECT_ACCEPT, CONNECT_CONFIRM,
+                      CONNECT_READY, CONNECT_CANCEL, pack_audio, unpack_audio, MAX_AUDIO_PAYLOAD)
 
 _failures = 0
 
@@ -179,34 +180,58 @@ def _raw(pub) -> bytes:
     return pub.public_bytes(Encoding.Raw, PublicFormat.Raw)
 
 
-def _fake_phone(sock: socket.socket, phone_id: X25519PrivateKey, results: dict) -> None:
-    """In-process v3 phone: REQ -> ACCEPT, then verifies the CONFIRM proof."""
-    data, addr = sock.recvfrom(512)
-    body = data[len(CONNECT_REQ):]
-    pc_id = body[:32]
-    pc_eph = body[32:64]
-    name_len = body[71]
-    results["channels"] = body[72 + name_len]
-    results["version"] = body[70]
+def _fake_phone(sock: socket.socket, phone_id: X25519PrivateKey, results: dict,
+                pending: bool = False, rogue_first: bool = False) -> None:
+    """In-process v4 phone. REQ -> PENDING (if `pending`, i.e. it doesn't know the
+    PC yet) or ACCEPT; REVEAL is checked against the commitment; a valid CONFIRM
+    is answered with READY."""
     eph = X25519PrivateKey.generate()
     ph_eph, ph_id = _raw(eph.public_key()), _raw(phone_id.public_key())
-    pc_id_k, pc_eph_k = X25519PublicKey.from_public_bytes(pc_id), X25519PublicKey.from_public_bytes(pc_eph)
-    keys = derive_session_keys(eph.exchange(pc_eph_k), eph.exchange(pc_id_k),
-                               phone_id.exchange(pc_eph_k), phone_id.exchange(pc_id_k),
-                               pc_id, pc_eph, ph_id, ph_eph)
-    results["keys"] = keys
-    results["code"] = pairing_code(pc_id, pc_eph, ph_id, ph_eph)
-    sock.sendto(CONNECT_ACCEPT + ph_eph + struct.pack("!HI", 5555, 42) + ph_id, addr)
-    sock.settimeout(3)
+    sock.settimeout(4)
+    state: dict = {}
     try:
         while True:
-            msg, _ = sock.recvfrom(512)
-            if msg.startswith(CONNECT_CONFIRM):
-                results["confirm_ok"] = hmac.compare_digest(
-                    msg[len(CONNECT_CONFIRM) + 32:], confirm_mac(keys, pc_id, pc_eph, ph_id, ph_eph))
-                return
-            if msg.startswith(CONNECT_CANCEL):
-                results["cancelled"] = True
+            data, addr = sock.recvfrom(512)
+            if data.startswith(CONNECT_REQ):
+                body = data[len(CONNECT_REQ):]
+                state["pc_id"], state["commit"] = body[:32], body[32:64]
+                name_len = body[71]
+                results["channels"] = body[72 + name_len]
+                results["version"] = body[70]
+                if pending and "pc_eph" not in state:
+                    sock.sendto(CONNECT_PENDING + ph_id + ph_eph, addr)
+                    continue
+                if rogue_first and not results.get("rogue_sent"):
+                    results["rogue_sent"] = True
+                    rogue = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    rogue_eph = _raw(X25519PrivateKey.generate().public_key())
+                    rogue.sendto(CONNECT_ACCEPT + rogue_eph + struct.pack("!HI", 6666, 7) + ph_id, addr)
+                    rogue.close()
+                sock.sendto(CONNECT_ACCEPT + ph_eph + struct.pack("!HI", 5555, 42) + ph_id, addr)
+            elif data.startswith(CONNECT_REVEAL):
+                pc_eph = data[len(CONNECT_REVEAL):][:32]
+                results["commit_ok"] = commitment(pc_eph) == state.get("commit")
+                if results["commit_ok"]:
+                    state["pc_eph"] = pc_eph
+                    results["code"] = pairing_code(state["pc_id"], pc_eph, ph_id, ph_eph)
+            elif data.startswith(CONNECT_CONFIRM):
+                pc_eph = data[len(CONNECT_CONFIRM):][:32]
+                if commitment(pc_eph) != state.get("commit"):
+                    continue
+                pc_id = state["pc_id"]
+                pc_id_k, pc_eph_k = X25519PublicKey.from_public_bytes(pc_id), X25519PublicKey.from_public_bytes(pc_eph)
+                keys = derive_session_keys(eph.exchange(pc_eph_k), eph.exchange(pc_id_k),
+                                           phone_id.exchange(pc_eph_k), phone_id.exchange(pc_id_k),
+                                           pc_id, pc_eph, ph_id, ph_eph)
+                results["keys"] = keys
+                ok = hmac.compare_digest(data[len(CONNECT_CONFIRM) + 32:][:32],
+                                         confirm_mac(keys, pc_id, pc_eph, ph_id, ph_eph))
+                results["confirm_ok"] = ok
+                if ok:
+                    sock.sendto(CONNECT_READY + ph_eph + ready_mac(keys, pc_id, pc_eph, ph_id, ph_eph), addr)
+                    return
+            elif data.startswith(CONNECT_CANCEL):
+                results["cancelled"] = data[len(CONNECT_CANCEL):][:32] == state.get("commit")
                 return
     except socket.timeout:
         pass
@@ -220,11 +245,11 @@ class _MemTrust:
     def pin(self, i): self.ids.add(i)
 
 
-def _handshake(pc_priv, phone_id, trust, confirm, claimed=None):
+def _handshake(pc_priv, phone_id, trust, confirm, claimed=None, pending=False, rogue_first=False, timeout=5):
     phone = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     phone.bind(("127.0.0.1", 0))
     results: dict = {}
-    t = threading.Thread(target=_fake_phone, args=(phone, phone_id, results))
+    t = threading.Thread(target=_fake_phone, args=(phone, phone_id, results, pending, rogue_first))
     t.start()
 
     class _Claim:  # public key of one identity, private key of another (an impersonator)
@@ -238,7 +263,7 @@ def _handshake(pc_priv, phone_id, trust, confirm, claimed=None):
     res = None
     try:
         res = ConnectClient(trust, confirm).connect("127.0.0.1", phone.getsockname()[1], _Claim(),
-                                                    1234, 99, "test", media_channels=2, timeout=5)
+                                                    1234, 99, "test", media_channels=2, timeout=timeout)
     except RuntimeError as e:
         err = e
     t.join()
@@ -247,7 +272,7 @@ def _handshake(pc_priv, phone_id, trust, confirm, claimed=None):
 
 
 def test_handshake() -> None:
-    print("v3 handshake")
+    print("v4 handshake")
     pc, phone_id = X25519PrivateKey.generate(), X25519PrivateKey.generate()
     trust = _MemTrust()
     shown: list[str] = []
@@ -256,12 +281,13 @@ def test_handshake() -> None:
         shown.append(code)
         return True
 
-    res, ph, err = _handshake(pc, phone_id, trust, yes)
+    res, ph, err = _handshake(pc, phone_id, trust, yes, pending=True)
     check(err is None and res.send_key == ph["keys"].pc_to_phone and res.recv_key == ph["keys"].phone_to_pc,
           "genuine PC and phone derive the same directional keys")
     check(res.send_key != res.recv_key, "the two directions use different keys")
+    check(ph.get("commit_ok") is True, "PC's revealed ephemeral key matches its commitment")
     check(ph.get("confirm_ok") is True, "phone verifies the PC's CONFIRM proof")
-    check(ph["version"] == 3 and ph["channels"] == 2, "version/channels parsed at v1-compatible offsets")
+    check(ph["version"] == 4 and ph["channels"] == 2, "version/channels parsed at v1-compatible offsets")
     check((res.android_audio_port, res.android_stream_id) == (5555, 42), "accept body parsed")
     check(len(shown) == 1 and shown[0].replace(" ", "") == ph["code"], "first pairing shows the code the phone computes")
     check(trust.is_pinned(_raw(phone_id.public_key())), "phone identity pinned after confirmation")
@@ -270,16 +296,48 @@ def test_handshake() -> None:
     res, ph, err = _handshake(pc, phone_id, trust, yes)
     check(err is None and not shown, "second connection to the pinned phone needs no prompt")
 
-    res, ph, err = _handshake(pc, X25519PrivateKey.generate(), trust, lambda c: False)
+    res, ph, err = _handshake(pc, X25519PrivateKey.generate(), trust, lambda c: False, pending=True)
     check(res is None and err is not None and ph.get("cancelled"), "different phone at the same IP is refused when the code is declined")
 
-    res, ph, err = _handshake(pc, phone_id, _MemTrust(), lambda c: False)
+    res, ph, err = _handshake(pc, phone_id, _MemTrust(), lambda c: False, pending=True)
     check(res is None and ph.get("cancelled"), "declining the code cancels the pairing")
 
     # An impersonator that replays the PC's identity public key without its private key
-    res, ph, err = _handshake(X25519PrivateKey.generate(), phone_id, trust, yes, claimed=pc)
-    check(res.send_key != ph["keys"].pc_to_phone and ph.get("confirm_ok") is False,
-          "replayed identity public key without its private key gets no working key / fails the proof")
+    res, ph, err = _handshake(X25519PrivateKey.generate(), phone_id, trust, yes, claimed=pc, timeout=2)
+    check(ph.get("confirm_ok") is False, "replayed identity public key without its private key fails the phone's proof")
+
+    # A spoofed ACCEPT (right identity, attacker's ephemeral key and port) arrives first:
+    # the PC must not start a session with it, only with the phone that returns READY.
+    res, ph, err = _handshake(pc, phone_id, trust, yes, rogue_first=True)
+    check(err is None and res.send_key == ph["keys"].pc_to_phone and res.android_audio_port == 5555,
+          "spoofed ACCEPT is ignored; the session is the real phone's")
+
+    # Nobody answers READY (phone-less spoofer): the connect attempt must fail, not start streaming.
+    spoof = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    spoof.bind(("127.0.0.1", 0))
+    stop = threading.Event()
+
+    def spoofer():
+        spoof.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                _, addr = spoof.recvfrom(512)
+            except (socket.timeout, OSError):
+                continue
+            spoof.sendto(CONNECT_ACCEPT + _raw(X25519PrivateKey.generate().public_key())
+                         + struct.pack("!HI", 6666, 7) + _raw(phone_id.public_key()), addr)
+
+    t = threading.Thread(target=spoofer)
+    t.start()
+    err = None
+    try:
+        ConnectClient(trust, yes).connect("127.0.0.1", spoof.getsockname()[1], pc, 1234, 99, "test", timeout=2)
+    except RuntimeError as e:
+        err = e
+    stop.set()
+    t.join()
+    spoof.close()
+    check(err is not None, "ACCEPT without the phone's READY proof never becomes a session")
 
 
 if __name__ == "__main__":

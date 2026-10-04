@@ -7,7 +7,7 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 
-from protocol import SESSION_KDF_SALT, SESSION_KDF_INFO, PAIRING_CODE_TAG, CONFIRM_TAG
+from protocol import SESSION_KDF_SALT, SESSION_KDF_INFO, PAIRING_CODE_TAG, CONFIRM_TAG, READY_TAG, COMMIT_TAG
 
 _log = logging.getLogger(__name__)
 
@@ -106,11 +106,23 @@ def confirm_mac(keys: SessionKeys, pc_id: bytes, pc_eph: bytes, ph_id: bytes, ph
                     hashlib.sha256).digest()
 
 
+def ready_mac(keys: SessionKeys, pc_id: bytes, pc_eph: bytes, ph_id: bytes, ph_eph: bytes) -> bytes:
+    """Phone's key-confirmation proof; distinct tag from confirm_mac so neither can be replayed as the other."""
+    return hmac.new(keys.confirm_key, READY_TAG + _transcript(pc_id, pc_eph, ph_id, ph_eph),
+                    hashlib.sha256).digest()
+
+
+def commitment(pc_eph: bytes) -> bytes:
+    """Binding commitment to the PC's ephemeral key, sent in CONNECT_REQ before the key itself."""
+    return hashlib.sha256(COMMIT_TAG + pc_eph).digest()
+
+
 def pairing_code(pc_id: bytes, pc_eph: bytes, ph_id: bytes, ph_eph: bytes) -> str:
     """8-digit numeric-comparison code shown on both devices at first pairing. It
-    covers all four public keys, so a man-in-the-middle (who must substitute its
-    own keys on each leg) cannot make both devices show the same code except by
-    grinding ~10^8 key pairs inside the 30 s pairing window."""
+    covers all four public keys. Because the PC commits to its ephemeral key
+    before seeing the phone's (see commitment()), a man-in-the-middle cannot
+    search for keys that make both codes match: each attempt is a single
+    ~1-in-10^8 online guess."""
     digest = hashlib.sha256(PAIRING_CODE_TAG + _transcript(pc_id, pc_eph, ph_id, ph_eph)).digest()
     n = int.from_bytes(digest[:8], "big") % 100_000_000
     return f"{n:08d}"

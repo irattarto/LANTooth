@@ -36,14 +36,20 @@ object Protocol {
     //       first-pairing numeric-comparison code, separate PC->phone / phone->PC
     //       keys, and a CONNECT_CONFIRM proof so a session only starts for a peer
     //       that really holds the trusted identity's private key
-    const val PROTOCOL_VERSION: Int = 3
+    //   v4: commit-then-reveal pairing code (the PC commits to its ephemeral key in
+    //       CONNECT_REQ and reveals it only after the phone's keys are known, so a
+    //       man-in-the-middle cannot grind keys to force matching codes), and a
+    //       CONNECT_READY key-confirmation proof from the phone
+    const val PROTOCOL_VERSION: Int = 4
 
     // Connect handshake (Bluetooth-style numeric comparison on first pairing, then automatic)
-    val CONNECT_REQ     = "CONNECT_REQ".toByteArray(Charsets.US_ASCII)
+    val CONNECT_REQ     = "CONNECT_REQ".toByteArray(Charsets.US_ASCII)      // PC -> phone: identity key + commitment to the ephemeral key
     val CONNECT_PENDING = "CONNECT_PENDING".toByteArray(Charsets.US_ASCII)  // phone -> PC: waiting for the user, carries keys for the code
+    val CONNECT_REVEAL  = "CONNECT_REVEAL".toByteArray(Charsets.US_ASCII)   // PC -> phone: the committed ephemeral key
     val CONNECT_ACCEPT  = "CONNECT_ACCEPT".toByteArray(Charsets.US_ASCII)
     val CONNECT_REJECT  = "CONNECT_REJECT".toByteArray(Charsets.US_ASCII)
-    val CONNECT_CONFIRM = "CONNECT_CONFIRM".toByteArray(Charsets.US_ASCII)  // PC -> phone: proof of the session key
+    val CONNECT_CONFIRM = "CONNECT_CONFIRM".toByteArray(Charsets.US_ASCII)  // PC -> phone: ephemeral key + proof of the session key
+    val CONNECT_READY   = "CONNECT_READY".toByteArray(Charsets.US_ASCII)    // phone -> PC: proof the phone derived the same keys
     val CONNECT_CANCEL  = "CONNECT_CANCEL".toByteArray(Charsets.US_ASCII)   // PC -> phone: user declined the code
 
     // CONNECT_REJECT body reason codes: 1B reason + 1B responder's PROTOCOL_VERSION
@@ -55,10 +61,12 @@ object Protocol {
     // so only a peer holding BOTH private identity keys can derive the session keys.
     // The transcript (all four public keys) is bound into the HKDF info; 96 bytes are
     // produced: PC->phone key, phone->PC key, confirmation key.
-    val SESSION_KDF_SALT = "lantooth-connect-v3".toByteArray(Charsets.US_ASCII)
-    val SESSION_KDF_INFO = "lantooth-session-v3".toByteArray(Charsets.US_ASCII)
-    val PAIRING_CODE_TAG = "lantooth-pair-v3".toByteArray(Charsets.US_ASCII)
-    val CONFIRM_TAG      = "lantooth-confirm-v3".toByteArray(Charsets.US_ASCII)
+    val SESSION_KDF_SALT = "lantooth-connect-v4".toByteArray(Charsets.US_ASCII)
+    val SESSION_KDF_INFO = "lantooth-session-v4".toByteArray(Charsets.US_ASCII)
+    val PAIRING_CODE_TAG = "lantooth-pair-v4".toByteArray(Charsets.US_ASCII)
+    val CONFIRM_TAG      = "lantooth-confirm-v4".toByteArray(Charsets.US_ASCII)
+    val READY_TAG        = "lantooth-ready-v4".toByteArray(Charsets.US_ASCII)
+    val COMMIT_TAG       = "lantooth-commit-v4".toByteArray(Charsets.US_ASCII)
 
     // Audio payload (inside the encrypted packet):
     //   [ 4B seq | 2B cur_len | cur Opus frame | previous Opus frame (optional) ]

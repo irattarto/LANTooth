@@ -21,32 +21,43 @@ private const val TAG = "LANTooth/Pairing"
 private const val REJECT_COOLDOWN_MS = 30_000L
 private const val ACCEPT_TIMEOUT_MS = 30_000L
 private const val HANDSHAKE_TTL_MS = 15_000L
-private const val MAX_HANDSHAKES = 8
-private const val MAX_PENDING_PROMPTS = 3
+private const val MAX_HANDSHAKES = 16
+private const val MAX_HANDSHAKES_PER_ID = 8
+// A handshake younger than this is never evicted to make room: a flood of forged
+// requests can only be refused, it cannot push the real PC's handshake out.
+private const val HANDSHAKE_MIN_AGE_MS = 2_000L
+private const val MAX_PENDING_PROMPTS = 1
 private const val VERSION_REPLY_MIN_GAP_MS = 1_000L
 private const val MAX_NAME_CHARS = 40
+private const val READY_COPIES = 5
+private const val READY_SPACING_MS = 30L
 
 /**
- * Server-side connect handshake (protocol v3) — Bluetooth-style numeric
+ * Server-side connect handshake (protocol v4) — Bluetooth-style numeric
  * comparison on first pairing, automatic afterwards.
  *
  * Android is the server: waits for a PC's CONNECT_REQ on PAIRING_PORT.
  *
- *   1. Receive CONNECT_REQ: pc_identity_pub(32) + pc_ephemeral_pub(32) +
- *      pc_audio_port(2) + pc_stream_id(4) + pc_protocol_version(1) +
- *      name_len(1) + pc_name + media_channels(1)
+ *   1. Receive CONNECT_REQ: pc_identity_pub(32) + commitment(32) + pc_audio_port(2) +
+ *      pc_stream_id(4) + pc_protocol_version(1) + name_len(1) + pc_name + media_channels(1).
+ *      The commitment is SHA-256 of the PC's ephemeral key, which the PC reveals
+ *      only later — see [CryptoEngine.commitment].
  *   2. A protocol version mismatch gets an immediate CONNECT_REJECT (no prompt).
- *   3. Unknown PC identity: show an 8-digit code (derived from both identity keys
- *      and both ephemeral keys) with Accept/Reject, and answer CONNECT_PENDING
- *      (our identity + ephemeral key) so the PC can show the same code. Accepting
- *      stores the PC's identity in the trust store. Reject/timeout: CONNECT_REJECT
- *      and a cooldown.
- *   4. Trusted PC identity: answer CONNECT_ACCEPT with our identity + ephemeral key.
+ *   3. We answer with our identity + a fresh ephemeral key: CONNECT_PENDING for an
+ *      unknown PC, CONNECT_ACCEPT for a trusted one. Because the PC committed first and
+ *      only reveals its key after seeing ours, a man-in-the-middle cannot search for
+ *      keys that make both devices display the same code.
+ *   4. Unknown PC: its CONNECT_REVEAL opens the commitment; only then is the 8-digit
+ *      code (from both identity keys and both ephemeral keys) shown with Accept/Reject.
+ *      Accepting stores the PC's identity in the trust store. Reject/timeout:
+ *      CONNECT_REJECT and a cooldown.
  *   5. The session starts only on a valid CONNECT_CONFIRM — an HMAC, under a key
  *      that needs BOTH private identity keys, over the whole transcript. A replayed
  *      or spoofed CONNECT_REQ (the identity public key is visible on the LAN) can at
  *      most draw one small CONNECT_ACCEPT; it can never occupy the session, make us
- *      stream to an address of its choosing, or block the real PC.
+ *      stream to an address of its choosing, or block the real PC. We then answer with
+ *      CONNECT_READY, our own proof, so the PC only starts a session with a phone that
+ *      really derived the keys.
  *
  * Trust is keyed by the PC's persistent identity public key, not its IP.
  */
@@ -55,7 +66,7 @@ class PairingManager(context: Context, private val scope: CoroutineScope) {
     private val trustStore = TrustStore(context)
     private val identity = PhoneIdentity(context)
     private val pendingDecisions = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
-    private val pendingEph = ConcurrentHashMap<String, String>()   // idHex -> ephemeral key of the request being prompted
+    private val pendingCommit = ConcurrentHashMap<String, String>()   // idHex -> commitment of the request being prompted
     private val rejectedRecently = ConcurrentHashMap<String, Long>()
     private val versionRepliedAt = ConcurrentHashMap<String, Long>()
 
@@ -73,7 +84,7 @@ class PairingManager(context: Context, private val scope: CoroutineScope) {
         val addr: InetAddress,
         val idHex: String,
         val pcId: ByteArray,
-        val pcEph: ByteArray,
+        val commitment: ByteArray,
         val phEphPriv: ByteArray,
         val phEphPub: ByteArray,
         val pcAudioPort: Int,
@@ -81,7 +92,10 @@ class PairingManager(context: Context, private val scope: CoroutineScope) {
         val name: String,
         val mediaChannels: Int,
         val createdAt: Long,
-    )
+    ) {
+        /** The PC's ephemeral key, set once a CONNECT_REVEAL / CONNECT_CONFIRM matching [commitment] arrives. */
+        var pcEph: ByteArray? = null
+    }
 
     /** Called by StreamService when the user taps Accept/Reject (notification action or in-app UI). */
     fun resolvePending(idHex: String, accept: Boolean) {
@@ -106,8 +120,41 @@ class PairingManager(context: Context, private val scope: CoroutineScope) {
     ): SessionInfo? = withContext(Dispatchers.IO) {
         val deadline = System.currentTimeMillis() + timeoutMs
         val buf = ByteArray(512)
-        val handshakes = LinkedHashMap<String, Handshake>()
+        val handshakes = LinkedHashMap<String, Handshake>()   // commitment hex -> state
         sock.soTimeout = 2000
+
+        /** Shows the pairing code for [hs] (once its ephemeral key is revealed) and waits for the user. */
+        fun startPrompt(hs: Handshake, pcEph: ByteArray, ip: String, addr: InetAddress, port: Int, commitHex: String) {
+            if (rejectedRecently.containsKey(hs.idHex)) return
+            if (pendingDecisions.containsKey(hs.idHex)) return                                  // already prompting
+            if (pendingDecisions.size >= MAX_PENDING_PROMPTS) return
+            val idHex = hs.idHex
+            val deferred = CompletableDeferred<Boolean>()
+            pendingDecisions[idHex] = deferred
+            pendingCommit[idHex] = commitHex
+            val code = CryptoEngine.pairingCode(hs.pcId, pcEph, identity.publicKey, hs.phEphPub)
+            onConnectRequest(hs.name, ip, idHex, code)
+
+            val name = hs.name
+            scope.launch(Dispatchers.IO) {
+                val accepted = withTimeoutOrNull(ACCEPT_TIMEOUT_MS) { deferred.await() } ?: false
+                if (accepted) {
+                    trustStore.trust(idHex, name, ip)
+                    Log.d(TAG, "Trusted $ip ($name)")
+                } else {
+                    rejectedRecently[idHex] = System.currentTimeMillis()
+                    runCatching {
+                        val reply = Protocol.CONNECT_REJECT + byteArrayOf(
+                            Protocol.REJECT_REASON_USER, Protocol.PROTOCOL_VERSION.toByte(),
+                        )
+                        sock.send(DatagramPacket(reply, reply.size, addr, port))
+                    }
+                    Log.d(TAG, "Rejected $ip ($name)")
+                }
+                pendingDecisions.remove(idHex)
+                pendingCommit.remove(idHex)
+            }
+        }
 
         while (System.currentTimeMillis() < deadline) {
             val pkt = DatagramPacket(buf, buf.size)
@@ -132,23 +179,45 @@ class PairingManager(context: Context, private val scope: CoroutineScope) {
             if (Protocol.startsWithTag(data, Protocol.CONNECT_CONFIRM)) {
                 val body = data.copyOfRange(Protocol.CONNECT_CONFIRM.size, data.size)
                 if (body.size < 64) continue
-                val ephHex = body.copyOfRange(0, 32).toHexString()
-                val hs = handshakes[ephHex] ?: continue
+                val pcEph = body.copyOfRange(0, 32)
+                val commitHex = CryptoEngine.commitment(pcEph).toHexString()
+                val hs = handshakes[commitHex] ?: continue
                 if (pkt.address != hs.addr || !trustStore.isTrusted(hs.idHex)) continue
                 val keys = try {
-                    CryptoEngine.deriveSessionKeys(identity.privateKey, hs.phEphPriv, hs.pcId, hs.pcEph, identity.publicKey, hs.phEphPub)
+                    CryptoEngine.deriveSessionKeys(identity.privateKey, hs.phEphPriv, hs.pcId, pcEph, identity.publicKey, hs.phEphPub)
                 } catch (e: Exception) {
                     Log.w(TAG, "Bad key from $ip: ${e.message}")
                     continue
                 }
-                val expected = CryptoEngine.confirmMac(keys, hs.pcId, hs.pcEph, identity.publicKey, hs.phEphPub)
+                val expected = CryptoEngine.confirmMac(keys, hs.pcId, pcEph, identity.publicKey, hs.phEphPub)
                 if (!MessageDigest.isEqual(expected, body.copyOfRange(32, 64))) {
                     Log.w(TAG, "Invalid CONFIRM from $ip — ignoring")
                     continue
                 }
-                handshakes.remove(ephHex)
+                handshakes.remove(commitHex)
+
+                // Our own proof, so the PC starts a session only with the real phone.
+                val ready = Protocol.CONNECT_READY + hs.phEphPub +
+                    CryptoEngine.readyMac(keys, hs.pcId, pcEph, identity.publicKey, hs.phEphPub)
+                repeat(READY_COPIES) {
+                    runCatching { sock.send(DatagramPacket(ready, ready.size, pkt.address, pkt.port)) }
+                    Thread.sleep(READY_SPACING_MS)
+                }
                 Log.d(TAG, "Session established with $ip (${hs.name})")
                 return@withContext SessionInfo(keys.phoneToPc, keys.pcToPhone, hs.pcAudioPort, hs.pcStreamId, ip, hs.name, hs.mediaChannels)
+            }
+
+            // ---- PC reveals the committed ephemeral key -> show the pairing code ---
+            if (Protocol.startsWithTag(data, Protocol.CONNECT_REVEAL)) {
+                val body = data.copyOfRange(Protocol.CONNECT_REVEAL.size, data.size)
+                if (body.size < 32) continue
+                val pcEph = body.copyOfRange(0, 32)
+                val commitHex = CryptoEngine.commitment(pcEph).toHexString()
+                val hs = handshakes[commitHex] ?: continue
+                if (pkt.address != hs.addr) continue
+                if (hs.pcEph == null) hs.pcEph = pcEph
+                if (!trustStore.isTrusted(hs.idHex)) startPrompt(hs, pcEph, ip, pkt.address, pkt.port, commitHex)
+                continue
             }
 
             // ---- PC's user declined the code ---------------------------------------
@@ -166,7 +235,7 @@ class PairingManager(context: Context, private val scope: CoroutineScope) {
             if (body.size < 32 + 32 + 2 + 4 + 1 + 1) continue
 
             val identityPub = body.sliceArray(0 until 32)
-            val ephPub = body.sliceArray(32 until 64)
+            val commitment = body.sliceArray(32 until 64)
             val bb = ByteBuffer.wrap(body, 64, body.size - 64).order(ByteOrder.BIG_ENDIAN)
             val pcAudioPort = bb.short.toInt() and 0xFFFF
             val pcStreamId = bb.int
@@ -193,56 +262,35 @@ class PairingManager(context: Context, private val scope: CoroutineScope) {
                 continue
             }
 
-            val ephHex = ephPub.toHexString()
+            val commitHex = commitment.toHexString()
             val trusted = trustStore.isTrusted(idHex)
 
             if (!trusted) {
                 if (rejectedRecently.containsKey(idHex)) continue
-                val promptEph = pendingEph[idHex]
-                if (promptEph != null && promptEph != ephHex) continue     // one prompt per identity
-                if (promptEph == null && pendingDecisions.size >= MAX_PENDING_PROMPTS) continue
+                val promptCommit = pendingCommit[idHex]
+                if (promptCommit != null && promptCommit != commitHex) continue     // one prompt per identity
             }
 
-            var hs = handshakes[ephHex]
+            var hs = handshakes[commitHex]
             if (hs == null) {
-                if (handshakes.size >= MAX_HANDSHAKES) handshakes.remove(handshakes.keys.first())
+                // Make room only by evicting a handshake that has had time to complete.
+                if (handshakes.size >= MAX_HANDSHAKES || handshakes.values.count { it.idHex == idHex } >= MAX_HANDSHAKES_PER_ID) {
+                    val oldest = if (handshakes.values.count { it.idHex == idHex } >= MAX_HANDSHAKES_PER_ID)
+                        handshakes.entries.first { it.value.idHex == idHex } else handshakes.entries.first()
+                    if (now - oldest.value.createdAt < HANDSHAKE_MIN_AGE_MS) continue
+                    handshakes.remove(oldest.key)
+                }
                 val priv = CryptoEngine.generateX25519PrivateKey()
-                hs = Handshake(pkt.address, idHex, identityPub, ephPub, priv, CryptoEngine.x25519PublicKey(priv),
+                hs = Handshake(pkt.address, idHex, identityPub, commitment, priv, CryptoEngine.x25519PublicKey(priv),
                     pcAudioPort, pcStreamId, pcName, mediaChannels, now)
-                handshakes[ephHex] = hs
+                handshakes[commitHex] = hs
             }
 
             if (!trusted) {
-                if (!pendingDecisions.containsKey(idHex)) {
-                    val deferred = CompletableDeferred<Boolean>()
-                    pendingDecisions[idHex] = deferred
-                    pendingEph[idHex] = ephHex
-                    val code = CryptoEngine.pairingCode(identityPub, ephPub, identity.publicKey, hs.phEphPub)
-                    onConnectRequest(pcName, ip, idHex, code)
-
-                    val addr = pkt.address
-                    val port = pkt.port
-                    scope.launch(Dispatchers.IO) {
-                        val accepted = withTimeoutOrNull(ACCEPT_TIMEOUT_MS) { deferred.await() } ?: false
-                        if (accepted) {
-                            trustStore.trust(idHex, pcName, ip)
-                            Log.d(TAG, "Trusted $ip ($pcName)")
-                        } else {
-                            rejectedRecently[idHex] = System.currentTimeMillis()
-                            runCatching {
-                                val reply = Protocol.CONNECT_REJECT + byteArrayOf(
-                                    Protocol.REJECT_REASON_USER, Protocol.PROTOCOL_VERSION.toByte(),
-                                )
-                                sock.send(DatagramPacket(reply, reply.size, addr, port))
-                            }
-                            Log.d(TAG, "Rejected $ip ($pcName)")
-                        }
-                        pendingDecisions.remove(idHex)
-                        pendingEph.remove(idHex)
-                    }
-                }
-                // Tell the PC our keys so it can show the same code; it keeps resending
-                // CONNECT_REQ, and the first one after the user accepts gets CONNECT_ACCEPT.
+                // Tell the PC our keys; it answers with CONNECT_REVEAL, which is what
+                // starts the prompt (the code needs its ephemeral key). It keeps
+                // resending CONNECT_REQ, and the first one after the user accepts gets
+                // CONNECT_ACCEPT.
                 runCatching {
                     val reply = Protocol.CONNECT_PENDING + identity.publicKey + hs.phEphPub
                     sock.send(DatagramPacket(reply, reply.size, pkt.address, pkt.port))

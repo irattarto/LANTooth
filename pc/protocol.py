@@ -34,14 +34,21 @@ MAX_UDP_PAYLOAD = 1400
 #       first-pairing numeric-comparison code, separate PC->phone / phone->PC
 #       keys, and a CONNECT_CONFIRM proof so a session only starts for a peer
 #       that really holds the trusted identity's private key
-PROTOCOL_VERSION = 3
+#   v4: commit-then-reveal pairing code (the PC commits to its ephemeral key in
+#       CONNECT_REQ and reveals it only after the phone's keys are known, so a
+#       man-in-the-middle cannot grind keys to force matching codes), and a
+#       CONNECT_READY key-confirmation proof from the phone, so the PC only
+#       starts a session with a peer that really derived the session keys
+PROTOCOL_VERSION = 4
 
 # Connect handshake (Bluetooth-style numeric comparison on first pairing, then automatic)
-CONNECT_REQ     = b"CONNECT_REQ"
+CONNECT_REQ     = b"CONNECT_REQ"      # PC -> phone: identity key + COMMITMENT to the ephemeral key
 CONNECT_PENDING = b"CONNECT_PENDING"   # phone -> PC: waiting for the user to accept; carries keys so both can show the code
+CONNECT_REVEAL  = b"CONNECT_REVEAL"    # PC -> phone: the committed ephemeral key (after PENDING)
 CONNECT_ACCEPT  = b"CONNECT_ACCEPT"
 CONNECT_REJECT  = b"CONNECT_REJECT"
-CONNECT_CONFIRM = b"CONNECT_CONFIRM"   # PC -> phone: proof of the session key, starts the session
+CONNECT_CONFIRM = b"CONNECT_CONFIRM"   # PC -> phone: ephemeral key + proof of the session key
+CONNECT_READY   = b"CONNECT_READY"     # phone -> PC: proof the phone derived the same keys, starts the session
 CONNECT_CANCEL  = b"CONNECT_CANCEL"    # PC -> phone: the user declined the pairing code
 
 # CONNECT_REJECT body reason codes: 1B reason + 1B responder's PROTOCOL_VERSION
@@ -53,10 +60,12 @@ REJECT_REASON_VERSION_MISMATCH = 1  # auto-rejected before any user prompt
 # so only a peer holding BOTH private identity keys can derive the session keys.
 # The transcript (all four public keys) is bound into the HKDF info, and 96 bytes
 # are produced: PC->phone key, phone->PC key, confirmation key.
-SESSION_KDF_SALT = b"lantooth-connect-v3"
-SESSION_KDF_INFO = b"lantooth-session-v3"
-PAIRING_CODE_TAG = b"lantooth-pair-v3"
-CONFIRM_TAG      = b"lantooth-confirm-v3"
+SESSION_KDF_SALT = b"lantooth-connect-v4"
+SESSION_KDF_INFO = b"lantooth-session-v4"
+PAIRING_CODE_TAG = b"lantooth-pair-v4"
+CONFIRM_TAG      = b"lantooth-confirm-v4"
+READY_TAG        = b"lantooth-ready-v4"
+COMMIT_TAG       = b"lantooth-commit-v4"
 
 # Audio payload (inside the encrypted packet):
 #   [ 4B seq | 2B cur_len | cur_len bytes current Opus frame | previous Opus frame (optional) ]

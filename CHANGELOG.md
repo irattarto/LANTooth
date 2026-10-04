@@ -1,11 +1,26 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.0] — 2026-10-04 (test release)
 
-Security hardening — **protocol v3**. PC and phone must be updated together; a
-v2 peer is refused with a version-mismatch message.
+Security hardening — **protocol v4**. PC and phone must be updated together; an
+older peer is refused with a version-mismatch message.
 
-### Changed
+### Changed in v4
+- The pairing code can no longer be forced by a man-in-the-middle: the PC commits
+  to its ephemeral key before seeing the phone's and reveals it afterwards, so
+  matching codes can't be ground out by trial.
+- The phone now proves it derived the session keys (CONNECT_READY) before the PC
+  starts a session, so a spoofed "accept" can't make the PC stream to a stranger.
+- Phone: a pairing request can only be accepted inside the app, where the code is
+  shown — the notification no longer has an Accept button. Only one pairing
+  prompt at a time; forged connection requests can no longer evict a real
+  handshake.
+- Phone: the identity private key is encrypted with an Android Keystore key
+  (an existing key is migrated automatically).
+- PC: the trusted-phones list is DPAPI-protected (the old trusted_phones.json
+  is migrated); the exe never loads libopus from VLC or PATH.
+
+### Changed in v3
 - Both devices now have an identity key. The first time a PC and phone connect,
   each shows the same 8-digit code; confirm they match on both (like Bluetooth
   numeric comparison). Every later connection is automatic.

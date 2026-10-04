@@ -20,7 +20,7 @@ object CryptoEngine {
         Hkdf.computeHkdf("HmacSHA256", ikm, salt, info, length)
 
     // ---------------------------------------------------------------------------
-    // v3 handshake key schedule (mirrors pc/crypto.py)
+    // v4 handshake key schedule (mirrors pc/crypto.py)
     // ---------------------------------------------------------------------------
 
     class SessionKeys(val pcToPhone: ByteArray, val phoneToPc: ByteArray, val confirmKey: ByteArray)
@@ -49,6 +49,17 @@ object CryptoEngine {
         mac.init(SecretKeySpec(keys.confirmKey, "HmacSHA256"))
         return mac.doFinal(Protocol.CONFIRM_TAG + transcript(pcId, pcEph, phId, phEph))
     }
+
+    /** Phone's key-confirmation proof; a distinct tag from [confirmMac] so neither can be replayed as the other. */
+    fun readyMac(keys: SessionKeys, pcId: ByteArray, pcEph: ByteArray, phId: ByteArray, phEph: ByteArray): ByteArray {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(keys.confirmKey, "HmacSHA256"))
+        return mac.doFinal(Protocol.READY_TAG + transcript(pcId, pcEph, phId, phEph))
+    }
+
+    /** Commitment to the PC's ephemeral key, sent in CONNECT_REQ before the key itself (mirrors pc/crypto.py). */
+    fun commitment(pcEph: ByteArray): ByteArray =
+        MessageDigest.getInstance("SHA-256").digest(Protocol.COMMIT_TAG + pcEph)
 
     /** 8-digit numeric-comparison code, "1234 5678" — identical to the PC's. */
     fun pairingCode(pcId: ByteArray, pcEph: ByteArray, phId: ByteArray, phEph: ByteArray): String {

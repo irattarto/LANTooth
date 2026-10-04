@@ -32,7 +32,6 @@ private const val NOTIF_ID = 1
 private const val CHANNEL_ID = "lantooth_stream"
 private const val CONNECT_CHANNEL_ID = "lantooth_connect_request"
 
-private const val ACTION_CONNECT_ACCEPT = "com.lantooth.CONNECT_ACCEPT"
 private const val ACTION_CONNECT_REJECT = "com.lantooth.CONNECT_REJECT"
 private const val EXTRA_ID_HEX = "id_hex"
 
@@ -201,10 +200,6 @@ class StreamService : Service() {
             MediaControlManager.ACTION_PREV       -> sendControlCommand(Protocol.CMD_PREV_TRACK, 0)
             MediaControlManager.ACTION_MIC_ON     -> setMicActive(true)
             MediaControlManager.ACTION_MIC_OFF    -> setMicActive(false)
-            ACTION_CONNECT_ACCEPT -> intent.getStringExtra(EXTRA_ID_HEX)?.let {
-                pairingManager.resolvePending(it, true)
-                clearPendingRequest(it)
-            }
             ACTION_CONNECT_REJECT -> intent.getStringExtra(EXTRA_ID_HEX)?.let {
                 pairingManager.resolvePending(it, false)
                 clearPendingRequest(it)
@@ -575,16 +570,15 @@ class StreamService : Service() {
     }
 
     private fun showConnectRequestNotification(name: String, ip: String, idHex: String, code: String) {
-        val acceptIntent = Intent(this, StreamService::class.java).apply {
-            action = ACTION_CONNECT_ACCEPT
-            putExtra(EXTRA_ID_HEX, idHex)
-        }
         val rejectIntent = Intent(this, StreamService::class.java).apply {
             action = ACTION_CONNECT_REJECT
             putExtra(EXTRA_ID_HEX, idHex)
         }
-        val acceptPending = PendingIntent.getService(
-            this, ("accept_$idHex").hashCode(), acceptIntent,
+        // Accepting is deliberately NOT a notification action: trusting a PC is permanent,
+        // so it can only be done in the app, on the screen that shows the pairing code.
+        val openApp = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val rejectPending = PendingIntent.getService(
@@ -595,12 +589,12 @@ class StreamService : Service() {
         val notification = NotificationCompat.Builder(this, CONNECT_CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_add)
             .setContentTitle("Connect to $name?")
-            .setContentText("Code $code — only Accept if your PC shows the same code ($ip)")
+            .setContentText("Code $code ($ip) — open LANTooth and Accept only if your PC shows the same code")
+            .setContentIntent(openApp)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setAutoCancel(true)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Reject", rejectPending)
-            .addAction(android.R.drawable.ic_menu_send, "Accept", acceptPending)
             .build()
 
         (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(idHex.hashCode(), notification)
