@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.0] — 2026-10-04
 
 Security hardening — **protocol v3**. PC and phone must be updated together; a
 v2 peer is refused with a version-mismatch message.
