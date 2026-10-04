@@ -269,4 +269,24 @@
         app:layout_constraintBottom_toBottomOf="@id/btnMic"
         android:layout_marginStart="12dp" />
 
+    <!-- Play/Pause: sends the PC a media play/pause key press (same as the
+         keyboard media key). Mirrors the Lock button on the other side of PTT. -->
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/btnPlayPause"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:minWidth="0dp"
+        android:minHeight="0dp"
+        android:insetTop="0dp"
+        android:insetBottom="0dp"
+        android:paddingHorizontal="14dp"
+        android:paddingVertical="8dp"
+        android:text="Play/Pause"
+        android:textSize="12sp"
+        app:cornerRadius="16dp"
+        app:layout_constraintEnd_toStartOf="@id/btnMic"
+        app:layout_constraintTop_toTopOf="@id/btnMic"
+        app:layout_constraintBottom_toBottomOf="@id/btnMic"
+        android:layout_marginEnd="12dp" />
+
 </androidx.constraintlayout.widget.ConstraintLayout>

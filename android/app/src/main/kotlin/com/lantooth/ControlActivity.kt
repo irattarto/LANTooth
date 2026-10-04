@@ -90,6 +90,11 @@ class ControlActivity : AppCompatActivity() {
             updateLockButton()
         }
 
+        // --- Media play/pause on the PC ---
+        binding.btnPlayPause.setOnClickListener {
+            streamService?.sendControlCommand(Protocol.CMD_PLAY_PAUSE, 0)
+        }
+
         // --- Headset / Mic-only mode ---
         binding.btnModeHeadset.setOnClickListener {
             streamService?.setMode(StreamMode.HEADSET)

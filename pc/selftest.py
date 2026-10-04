@@ -27,7 +27,8 @@ from crypto import AntiReplayWindow, derive_session_keys, confirm_mac, ready_mac
 from jitter_buffer import JitterBuffer, FRAME_S
 from pairing import ConnectClient
 from protocol import (CONNECT_REQ, CONNECT_PENDING, CONNECT_REVEAL, CONNECT_ACCEPT, CONNECT_CONFIRM,
-                      CONNECT_READY, CONNECT_UNKNOWN, CONNECT_CANCEL, pack_audio, unpack_audio, MAX_AUDIO_PAYLOAD)
+                      CONNECT_READY, CONNECT_UNKNOWN, CONNECT_CANCEL, pack_audio, unpack_audio, MAX_AUDIO_PAYLOAD,
+                      pack_control, unpack_control, CMD_PLAY_PAUSE, CMD_NEXT_TRACK)
 
 _failures = 0
 
@@ -62,6 +63,13 @@ def test_audio_framing() -> None:
     big = bytes(800)
     check(len(pack_audio(1, big, big)) <= MAX_AUDIO_PAYLOAD, "oversized redundancy is dropped")
     check(unpack_audio(b"\x00\x00\x00\x01\x00\x09abc") is None, "truncated payload rejected")
+
+
+def test_control_framing() -> None:
+    print("control framing")
+    check(unpack_control(pack_control(CMD_PLAY_PAUSE)) == (CMD_PLAY_PAUSE, 0), "play/pause round-trip")
+    check(unpack_control(pack_control(CMD_NEXT_TRACK, 513)) == (CMD_NEXT_TRACK, 513), "command + value round-trip")
+    check(unpack_control(b"\x01") == (0, 0), "truncated control rejected")
 
 
 def _sine(freq, sr, n, channels=1):
@@ -372,6 +380,7 @@ def test_handshake() -> None:
 if __name__ == "__main__":
     test_replay_window()
     test_audio_framing()
+    test_control_framing()
     frames = test_codec()
     test_jitter_buffer(frames)
     test_resampler()

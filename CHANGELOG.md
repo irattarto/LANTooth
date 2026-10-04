@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.2] — 2026-10-04 (test release)
+
+- Phone: new Play/Pause button on the control screen; it presses the PC's media
+  play/pause key (previously only the notification buttons could do this).
+
 ## [0.2.1] — 2026-10-04 (test release)
 
 Fixes for pairing in 0.2.0, where one device could show a code the other didn't.
