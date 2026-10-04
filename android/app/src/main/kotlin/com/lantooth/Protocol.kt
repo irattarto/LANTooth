@@ -50,6 +50,7 @@ object Protocol {
     val CONNECT_REJECT  = "CONNECT_REJECT".toByteArray(Charsets.US_ASCII)
     val CONNECT_CONFIRM = "CONNECT_CONFIRM".toByteArray(Charsets.US_ASCII)  // PC -> phone: ephemeral key + proof of the session key
     val CONNECT_READY   = "CONNECT_READY".toByteArray(Charsets.US_ASCII)    // phone -> PC: proof the phone derived the same keys
+    val CONNECT_UNKNOWN = "CONNECT_UNKNOWN".toByteArray(Charsets.US_ASCII)  // PC -> phone: authenticated "I no longer know you", re-pair with a code
     val CONNECT_CANCEL  = "CONNECT_CANCEL".toByteArray(Charsets.US_ASCII)   // PC -> phone: user declined the code
 
     // CONNECT_REJECT body reason codes: 1B reason + 1B responder's PROTOCOL_VERSION
@@ -67,6 +68,7 @@ object Protocol {
     val CONFIRM_TAG      = "lantooth-confirm-v4".toByteArray(Charsets.US_ASCII)
     val READY_TAG        = "lantooth-ready-v4".toByteArray(Charsets.US_ASCII)
     val COMMIT_TAG       = "lantooth-commit-v4".toByteArray(Charsets.US_ASCII)
+    val UNKNOWN_TAG      = "lantooth-unknown-v4".toByteArray(Charsets.US_ASCII)
 
     // Audio payload (inside the encrypted packet):
     //   [ 4B seq | 2B cur_len | cur Opus frame | previous Opus frame (optional) ]

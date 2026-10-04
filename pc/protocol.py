@@ -49,6 +49,7 @@ CONNECT_ACCEPT  = b"CONNECT_ACCEPT"
 CONNECT_REJECT  = b"CONNECT_REJECT"
 CONNECT_CONFIRM = b"CONNECT_CONFIRM"   # PC -> phone: ephemeral key + proof of the session key
 CONNECT_READY   = b"CONNECT_READY"     # phone -> PC: proof the phone derived the same keys, starts the session
+CONNECT_UNKNOWN = b"CONNECT_UNKNOWN"   # PC -> phone: "I no longer know you" (authenticated); phone must re-pair with a code
 CONNECT_CANCEL  = b"CONNECT_CANCEL"    # PC -> phone: the user declined the pairing code
 
 # CONNECT_REJECT body reason codes: 1B reason + 1B responder's PROTOCOL_VERSION
@@ -66,6 +67,7 @@ PAIRING_CODE_TAG = b"lantooth-pair-v4"
 CONFIRM_TAG      = b"lantooth-confirm-v4"
 READY_TAG        = b"lantooth-ready-v4"
 COMMIT_TAG       = b"lantooth-commit-v4"
+UNKNOWN_TAG      = b"lantooth-unknown-v4"
 
 # Audio payload (inside the encrypted packet):
 #   [ 4B seq | 2B cur_len | cur_len bytes current Opus frame | previous Opus frame (optional) ]

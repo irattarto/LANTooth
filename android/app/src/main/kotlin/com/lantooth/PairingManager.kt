@@ -207,6 +207,32 @@ class PairingManager(context: Context, private val scope: CoroutineScope) {
                 return@withContext SessionInfo(keys.phoneToPc, keys.pcToPhone, hs.pcAudioPort, hs.pcStreamId, ip, hs.name, hs.mediaChannels)
             }
 
+            // ---- PC no longer knows us: drop our trust, re-pair with a code ----------
+            if (Protocol.startsWithTag(data, Protocol.CONNECT_UNKNOWN)) {
+                val body = data.copyOfRange(Protocol.CONNECT_UNKNOWN.size, data.size)
+                if (body.size < 64) continue
+                val pcEph = body.copyOfRange(0, 32)
+                val commitHex = CryptoEngine.commitment(pcEph).toHexString()
+                val hs = handshakes[commitHex] ?: continue
+                if (pkt.address != hs.addr || !trustStore.isTrusted(hs.idHex)) continue
+                // Only a PC holding its private identity key can produce this MAC, so a
+                // bystander cannot use it to make us forget a PC.
+                val keys = try {
+                    CryptoEngine.deriveSessionKeys(identity.privateKey, hs.phEphPriv, hs.pcId, pcEph, identity.publicKey, hs.phEphPub)
+                } catch (e: Exception) { continue }
+                val expected = CryptoEngine.unknownMac(keys, hs.pcId, pcEph, identity.publicKey, hs.phEphPub)
+                if (!MessageDigest.isEqual(expected, body.copyOfRange(32, 64))) continue
+                Log.d(TAG, "$ip (${hs.name}) no longer knows us — pairing again")
+                trustStore.forget(hs.idHex)
+                hs.pcEph = pcEph
+                runCatching {
+                    val reply = Protocol.CONNECT_PENDING + identity.publicKey + hs.phEphPub
+                    sock.send(DatagramPacket(reply, reply.size, pkt.address, pkt.port))
+                }
+                startPrompt(hs, pcEph, ip, pkt.address, pkt.port, commitHex)
+                continue
+            }
+
             // ---- PC reveals the committed ephemeral key -> show the pairing code ---
             if (Protocol.startsWithTag(data, Protocol.CONNECT_REVEAL)) {
                 val body = data.copyOfRange(Protocol.CONNECT_REVEAL.size, data.size)

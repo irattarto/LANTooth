@@ -57,6 +57,13 @@ object CryptoEngine {
         return mac.doFinal(Protocol.READY_TAG + transcript(pcId, pcEph, phId, phEph))
     }
 
+    /** PC's authenticated "I don't have you pinned" (mirrors pc/crypto.py unknown_mac). */
+    fun unknownMac(keys: SessionKeys, pcId: ByteArray, pcEph: ByteArray, phId: ByteArray, phEph: ByteArray): ByteArray {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(keys.confirmKey, "HmacSHA256"))
+        return mac.doFinal(Protocol.UNKNOWN_TAG + transcript(pcId, pcEph, phId, phEph))
+    }
+
     /** Commitment to the PC's ephemeral key, sent in CONNECT_REQ before the key itself (mirrors pc/crypto.py). */
     fun commitment(pcEph: ByteArray): ByteArray =
         MessageDigest.getInstance("SHA-256").digest(Protocol.COMMIT_TAG + pcEph)

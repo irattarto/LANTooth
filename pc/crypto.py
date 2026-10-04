@@ -7,7 +7,7 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 
-from protocol import SESSION_KDF_SALT, SESSION_KDF_INFO, PAIRING_CODE_TAG, CONFIRM_TAG, READY_TAG, COMMIT_TAG
+from protocol import SESSION_KDF_SALT, SESSION_KDF_INFO, PAIRING_CODE_TAG, CONFIRM_TAG, READY_TAG, COMMIT_TAG, UNKNOWN_TAG
 
 _log = logging.getLogger(__name__)
 
@@ -109,6 +109,13 @@ def confirm_mac(keys: SessionKeys, pc_id: bytes, pc_eph: bytes, ph_id: bytes, ph
 def ready_mac(keys: SessionKeys, pc_id: bytes, pc_eph: bytes, ph_id: bytes, ph_eph: bytes) -> bytes:
     """Phone's key-confirmation proof; distinct tag from confirm_mac so neither can be replayed as the other."""
     return hmac.new(keys.confirm_key, READY_TAG + _transcript(pc_id, pc_eph, ph_id, ph_eph),
+                    hashlib.sha256).digest()
+
+
+def unknown_mac(keys: SessionKeys, pc_id: bytes, pc_eph: bytes, ph_id: bytes, ph_eph: bytes) -> bytes:
+    """PC's authenticated "I don't have you pinned" — lets the phone drop its trust and re-pair with a code,
+    without an attacker being able to force that by replaying other handshake messages."""
+    return hmac.new(keys.confirm_key, UNKNOWN_TAG + _transcript(pc_id, pc_eph, ph_id, ph_eph),
                     hashlib.sha256).digest()
 
 

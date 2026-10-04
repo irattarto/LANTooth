@@ -15,6 +15,7 @@ Both devices have a persistent X25519 identity key. PC is the initiator:
   CONNECT_REJECT:  reason(1B) + phone_protocol_version(1B)
   CONNECT_CONFIRM: pc_ephemeral_pub(32) + HMAC(confirm_key, transcript)  (several copies)
   CONNECT_READY:   phone_ephemeral_pub(32) + HMAC(confirm_key, transcript)  (phone's proof)
+  CONNECT_UNKNOWN: pc_ephemeral_pub(32) + HMAC(confirm_key, transcript)  (phone must re-pair)
   CONNECT_CANCEL:  commitment(32)  (user declined the code)
 
 The PC commits to its ephemeral key before it sees the phone's and reveals it
@@ -48,11 +49,11 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
 )
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from crypto import derive_session_keys, confirm_mac, ready_mac, commitment, pairing_code, format_code
+from crypto import derive_session_keys, confirm_mac, ready_mac, unknown_mac, commitment, pairing_code, format_code
 from phones import PhoneTrustStore
 from protocol import (
     CONNECT_REQ, CONNECT_PENDING, CONNECT_REVEAL, CONNECT_ACCEPT, CONNECT_REJECT,
-    CONNECT_CONFIRM, CONNECT_READY, CONNECT_CANCEL,
+    CONNECT_CONFIRM, CONNECT_READY, CONNECT_UNKNOWN, CONNECT_CANCEL,
     PROTOCOL_VERSION, REJECT_REASON_VERSION_MISMATCH,
 )
 
@@ -208,7 +209,13 @@ class ConnectClient:
                         )
                     except ValueError:
                         continue  # bad / low-order key from a spoofed packet
-                    self._ensure_pinned(sock, addr, pc_id, pc_eph, ph_id, ph_eph_raw)
+                    if not self._trust.is_pinned(ph_id):
+                        # The phone is auto-accepting us but we don't know it (we forgot it, or
+                        # it was paired elsewhere). There is no code on the phone to compare, so
+                        # tell it, authenticated, to forget us and re-pair; its PENDING reply
+                        # then brings up the code on both sides.
+                        sock.sendto(CONNECT_UNKNOWN + pc_eph + unknown_mac(keys, pc_id, pc_eph, ph_id, ph_eph_raw), addr)
+                        continue
 
                     # Not a session yet: only the phone's READY proof makes it one, so a
                     # spoofed ACCEPT just adds an offer that never completes.
