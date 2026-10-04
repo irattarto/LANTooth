@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.3] — 2026-10-04 (test release)
+
+- Phone: Play/Pause, Hold to Talk and Lock are now three round buttons of the
+  same size.
+
 ## [0.2.2] — 2026-10-04 (test release)
 
 - Phone: new Play/Pause button on the control screen; it presses the PC's media
