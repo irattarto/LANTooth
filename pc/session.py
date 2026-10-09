@@ -18,6 +18,8 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
+import numpy as np
+
 import codec
 from audio_engine import AudioCapture, WasapiLoopbackCapture, AudioPlayback
 from jitter_buffer import JitterBuffer
@@ -45,6 +47,12 @@ STATS_INTERVAL_S = 2.0
 # resume; after that the pause is left alone (the user has likely moved on).
 RESUME_WINDOW_S = 30.0
 _link_paused_at: float | None = None
+
+# Only pause if PC audio was actually playing: play/pause is a toggle, so
+# pressing it while nothing plays would start something instead. "Playing" means
+# the captured PCM had a sample above ACTIVE_PEAK within the last ACTIVE_WINDOW_S.
+ACTIVE_PEAK = 100          # int16 units, about -50 dBFS
+ACTIVE_WINDOW_S = 2.0
 
 MEDIA_BITRATE = {1: 128_000, 2: 192_000}   # PC -> phone, by channel count
 
@@ -196,6 +204,7 @@ def stream_session(
     prev_opus: bytes | None = None
     last_stats = time.monotonic()
     last_keepalive = time.monotonic()
+    last_active = float("-inf")   # last time the captured PC audio was non-silent
     reason = END_STOPPED
 
     def stats() -> SessionStats:
@@ -210,6 +219,8 @@ def stream_session(
         while not should_stop():
             pcm = capture.read(timeout=0.02)
             if pcm:
+                if np.abs(np.frombuffer(pcm, dtype=np.int16)).max(initial=0) > ACTIVE_PEAK:
+                    last_active = time.monotonic()
                 try:
                     opus = encoder.encode(pcm)
                     stream.send_audio(pack_audio(seq, opus, prev_opus))
@@ -235,8 +246,9 @@ def stream_session(
             if now - last_recv > LIVENESS_TIMEOUT_S:
                 reason = END_TIMEOUT
                 on_status("Connection lost — reconnecting…")
-                handle_control(CMD_PLAY_PAUSE)
-                _link_paused_at = time.monotonic()
+                if now - last_active <= ACTIVE_WINDOW_S:
+                    handle_control(CMD_PLAY_PAUSE)
+                    _link_paused_at = now
                 break
 
             if now - last_stats >= STATS_INTERVAL_S:
