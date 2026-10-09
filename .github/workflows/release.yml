@@ -142,6 +142,8 @@ jobs:
           awk -v v="$v" 'f && /^## / {exit} f {print} /^## / && index($0, "[" v "]") {f=1}' CHANGELOG.md > notes.md
           [ -s notes.md ] || echo "LANTooth $v" > notes.md
           cat notes.md
+          # Versions whose CHANGELOG heading says "test release" are published as pre-releases
+          if grep -q "^## \[$v\].*test release" CHANGELOG.md; then echo "PRERELEASE=--prerelease" >> "$GITHUB_ENV"; fi
 
       - name: Publish GitHub Release
         env:
@@ -150,8 +152,8 @@ jobs:
           # Idempotent: a re-run (or duplicate run) refreshes the existing release.
           if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" artifacts/* --clobber
-            gh release edit "$GITHUB_REF_NAME" --title "LANTooth $GITHUB_REF_NAME" --notes-file notes.md
+            gh release edit "$GITHUB_REF_NAME" --title "LANTooth $GITHUB_REF_NAME" --notes-file notes.md ${PRERELEASE:-}
           else
             gh release create "$GITHUB_REF_NAME" artifacts/* \
-              --title "LANTooth $GITHUB_REF_NAME" --notes-file notes.md
+              --title "LANTooth $GITHUB_REF_NAME" --notes-file notes.md ${PRERELEASE:-}
           fi

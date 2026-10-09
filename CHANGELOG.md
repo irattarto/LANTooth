@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.4] — 2026-10-09 (test release)
+
+- PC: when the connection to the phone is lost while PC audio is playing, sends
+  the system Play/Pause media key (same as the phone's button). If the
+  connection is restored within 30 s, sends it again to resume.
+
 ## [0.2.3] — 2026-10-04 (test release)
 
 - Phone: Play/Pause, Hold to Talk and Lock are now three round buttons of the
