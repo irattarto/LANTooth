@@ -52,7 +52,7 @@ _link_paused_at: float | None = None
 # pressing it while nothing plays would start something instead. "Playing" means
 # the captured PCM had a sample above ACTIVE_PEAK within the last ACTIVE_WINDOW_S.
 ACTIVE_PEAK = 100          # int16 units, about -50 dBFS
-ACTIVE_WINDOW_S = 2.0
+ACTIVE_WINDOW_S = 5.0
 
 MEDIA_BITRATE = {1: 128_000, 2: 192_000}   # PC -> phone, by channel count
 
