@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.2.4] — 2026-10-09 (test release)
+## [0.2.4] — 2026-10-09
 
 - PC: when the connection to the phone is lost while PC audio is playing, sends
   the system Play/Pause media key (same as the phone's button). If the
