@@ -25,6 +25,7 @@ from media_control import handle_control
 from pairing import ConnectClient, SessionResult
 from protocol import (
     pack_control, unpack_control, pack_audio, unpack_audio, CMD_KEEPALIVE, CMD_BYE,
+    CMD_PLAY_PAUSE,
 )
 from stream import UDPStream
 
@@ -37,6 +38,13 @@ _log = logging.getLogger(__name__)
 KEEPALIVE_INTERVAL_S = 1.0
 LIVENESS_TIMEOUT_S = 6.0
 STATS_INTERVAL_S = 2.0
+
+# When the link drops we send the same system play/pause media key the phone's
+# own button would, so whatever is playing on the PC stops instead of playing to
+# nobody. If a session comes back within RESUME_WINDOW_S we send it again to
+# resume; after that the pause is left alone (the user has likely moved on).
+RESUME_WINDOW_S = 30.0
+_link_paused_at: float | None = None
 
 MEDIA_BITRATE = {1: 128_000, 2: 192_000}   # PC -> phone, by channel count
 
@@ -176,6 +184,13 @@ def stream_session(
         stream.stop()
         return END_ERROR
 
+    # Link restored shortly after we paused the PC's media: resume it.
+    global _link_paused_at
+    paused_at, _link_paused_at = _link_paused_at, None
+    if paused_at is not None and time.monotonic() - paused_at <= RESUME_WINDOW_S:
+        handle_control(CMD_PLAY_PAUSE)
+        _log.info("link restored; resumed media playback")
+
     sent_count = 0
     seq = 0
     prev_opus: bytes | None = None
@@ -220,6 +235,8 @@ def stream_session(
             if now - last_recv > LIVENESS_TIMEOUT_S:
                 reason = END_TIMEOUT
                 on_status("Connection lost — reconnecting…")
+                handle_control(CMD_PLAY_PAUSE)
+                _link_paused_at = time.monotonic()
                 break
 
             if now - last_stats >= STATS_INTERVAL_S:
