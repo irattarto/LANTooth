@@ -26,7 +26,10 @@ import pystray
 from PIL import Image, ImageDraw, ImageTk
 
 from appdata import resource_path, setup_logging
-from audio_engine import hostapi_name, is_wdm_ks, list_capture_options, list_playback_options
+import codec
+from audio_engine import (
+    WASAPI_AVAILABLE, hostapi_name, hostapi_rank, is_wdm_ks, list_capture_options, list_playback_options,
+)
 from config import forget_ip, load_config, remember_ip, save_config
 from identity import load_or_create_identity
 from pairing import ConnectCancelled, ConnectClient
@@ -41,6 +44,7 @@ _log = logging.getLogger("lantooth.gui")
 RECONNECT_DELAY_S = 5.0
 CONNECT_ATTEMPT_TIMEOUT_S = 45.0   # first pairing needs time to compare the code on both devices
 SYSTEM_DEFAULT_PLAYBACK_LABEL = "System default (monitor only)"
+SYSTEM_DEFAULT_LOOPBACK_LABEL = "System default output [WASAPI loopback]"
 _ICON_FILE = "lantooth_icon.png"
 
 
@@ -86,6 +90,7 @@ class StreamWorker:
         self._confirm_answer: bool | None = None
         self._confirm_ready = threading.Event()
         self._gen_now = 0
+        self._latency_test = threading.Event()
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
@@ -93,16 +98,18 @@ class StreamWorker:
     def is_stopping(self) -> bool:
         return self.is_running() and self._stop.is_set()
 
-    def start(self, android_ip, capture_backend, capture_device, playback_device, media_channels) -> bool:
+    def start(self, android_ip, capture_backend, capture_device, playback_device, media_channels,
+              mic_agc=True, exclusive=False) -> bool:
         if self.is_running():
             return False
         self._stop.clear()
+        self._latency_test.clear()
         self.generation += 1
         self._gen_now = self.generation
         self._thread = threading.Thread(
             target=self._run,
             args=(self.generation, android_ip, capture_backend, capture_device,
-                  playback_device, media_channels),
+                  playback_device, media_channels, mic_agc, exclusive),
             daemon=True,
             name="lantooth-worker",
         )
@@ -111,6 +118,9 @@ class StreamWorker:
 
     def stop(self) -> None:
         self._stop.set()
+
+    def request_latency_test(self) -> None:
+        self._latency_test.set()
 
     def _ask_pairing_code(self, code: str) -> bool:
         """Called on the worker thread at first pairing: has the GUI thread ask the
@@ -134,14 +144,15 @@ class StreamWorker:
         if self._thread is not None:
             self._thread.join(timeout)
 
-    def _run(self, gen, android_ip, capture_backend, capture_device, playback_device, media_channels) -> None:
+    def _run(self, gen, android_ip, capture_backend, capture_device, playback_device, media_channels,
+             mic_agc, exclusive) -> None:
         def status(text: str) -> None:
             self._q.put(("status", text, gen))
 
         def stats(s: SessionStats) -> None:
             self._q.put(("stats", (
                 f"to phone: {s.sent}   from phone: {s.received} recv · {s.recovered} recovered · "
-                f"{s.concealed} lost · {s.underruns} underruns   buffer {s.target_depth * 20} ms"
+                f"{s.concealed} lost · {s.underruns} underruns   buffer {s.target_depth * codec.FRAME_MS} ms"
             ), gen))
 
         final = ""
@@ -176,6 +187,9 @@ class StreamWorker:
                     on_status=status,
                     on_stats=stats,
                     media_channels=media_channels,
+                    mic_agc=mic_agc,
+                    exclusive_playback=exclusive,
+                    latency_test=self._latency_test,
                 )
                 if reason == END_BYE:
                     final = "Phone disconnected — press Connect to reconnect"
@@ -205,8 +219,8 @@ class LanToothGUI:
 
         self.root = tk.Tk()
         self.root.title(f"LANTooth {__version__}")
-        self.root.geometry("640x360")
-        self.root.minsize(480, 340)
+        self.root.geometry("640x430")
+        self.root.minsize(480, 410)
         self.root.resizable(True, True)
         self.root.protocol("WM_DELETE_WINDOW", self._hide_to_tray)
         self.root.bind("<Unmap>", self._on_unmap)
@@ -270,28 +284,42 @@ class LanToothGUI:
         self.playback_combo.grid(row=3, column=1, sticky="we", **pad)
         self.playback_combo.bind("<<ComboboxSelected>>", lambda _e: self._update_playback_hint())
 
-        self.connect_btn = ttk.Button(frm, text="Connect", command=self._toggle_connect)
-        self.connect_btn.grid(row=4, column=0, columnspan=2, sticky="we", **pad)
+        self.agc_var = tk.BooleanVar(value=bool(self.cfg.get("mic_agc", True)))
+        ttk.Checkbutton(
+            frm, text="Auto-level the phone mic (AGC + limiter)", variable=self.agc_var,
+        ).grid(row=4, column=1, sticky="w", **pad)
+
+        self.exclusive_var = tk.BooleanVar(value=bool(self.cfg.get("wasapi_exclusive", False)))
+        ttk.Checkbutton(
+            frm, text="Exclusive mode (lowest latency; WASAPI devices only, blocks other apps on it)",
+            variable=self.exclusive_var,
+        ).grid(row=5, column=1, sticky="w", **pad)
+
+        btn_row = ttk.Frame(frm)
+        btn_row.grid(row=6, column=0, columnspan=2, sticky="we", **pad)
+        self.connect_btn = ttk.Button(btn_row, text="Connect", command=self._toggle_connect)
+        self.connect_btn.pack(side="left", fill="x", expand=True)
+        ttk.Button(btn_row, text="Latency test", width=14, command=self._latency_test).pack(side="left", padx=(6, 0))
 
         self.status_var = tk.StringVar(value="Idle")
         self.status_label = ttk.Label(frm, textvariable=self.status_var, wraplength=560)
-        self.status_label.grid(row=5, column=0, columnspan=2, sticky="w", **pad)
+        self.status_label.grid(row=7, column=0, columnspan=2, sticky="w", **pad)
 
         self.stats_var = tk.StringVar(value="")
         self.stats_label = ttk.Label(frm, textvariable=self.stats_var, wraplength=560, foreground="#666")
-        self.stats_label.grid(row=6, column=0, columnspan=2, sticky="w", **pad)
+        self.stats_label.grid(row=8, column=0, columnspan=2, sticky="w", **pad)
 
         self.playback_hint_var = tk.StringVar(value="")
         self.playback_hint_label = ttk.Label(
             frm, textvariable=self.playback_hint_var, wraplength=560, foreground="#888"
         )
-        self.playback_hint_label.grid(row=7, column=0, columnspan=2, sticky="w", **pad)
+        self.playback_hint_label.grid(row=9, column=0, columnspan=2, sticky="w", **pad)
 
         self.footer_label = ttk.Label(
             frm, text="Closing this window minimizes to the tray — use Quit there to exit.",
             wraplength=560, foreground="#888",
         )
-        self.footer_label.grid(row=8, column=0, columnspan=2, sticky="w", **pad)
+        self.footer_label.grid(row=10, column=0, columnspan=2, sticky="w", **pad)
 
         frm.columnconfigure(1, weight=1)
 
@@ -308,10 +336,14 @@ class LanToothGUI:
         return f"  ({name})" if name else ""
 
     def _populate_devices(self) -> None:
-        self.capture_options = [
+        # WASAPI first everywhere: it buffers the least of the Windows host APIs.
+        sources = [
             opt for opt in list_capture_options()
             if opt[3] and not (opt[0] == "sd" and is_wdm_ks(opt[1]))
         ]
+        sources.sort(key=lambda o: 0 if o[0] == "wasapi" else 1 + hostapi_rank(o[1]))
+        default_loopback = [("wasapi", None, SYSTEM_DEFAULT_LOOPBACK_LABEL, True)] if WASAPI_AVAILABLE else []
+        self.capture_options = default_loopback + sources
         labels = [
             label + (self._hostapi_suffix(idx) if backend == "sd" else "")
             for backend, idx, label, _ in self.capture_options
@@ -326,9 +358,10 @@ class LanToothGUI:
             )
             self.capture_combo.current(default_i)
 
-        self.playback_options = [(None, SYSTEM_DEFAULT_PLAYBACK_LABEL, False)] + [
-            opt for opt in list_playback_options() if not is_wdm_ks(opt[0])
-        ]
+        self.playback_options = [(None, SYSTEM_DEFAULT_PLAYBACK_LABEL, False)] + sorted(
+            (opt for opt in list_playback_options() if not is_wdm_ks(opt[0])),
+            key=lambda o: hostapi_rank(o[0]),
+        )
         play_labels = [
             name + (self._hostapi_suffix(idx) if idx is not None else "")
             for idx, name, _ in self.playback_options
@@ -435,17 +468,27 @@ class LanToothGUI:
         backend, cap_idx = self._selected_capture()
         play_idx = self._selected_playback()
         stereo = self.stereo_var.get()
+        agc = self.agc_var.get()
+        exclusive = self.exclusive_var.get()
 
         # The IP itself is remembered only once a connection succeeds ("connected").
         self.cfg.update({
             "capture_device_name": self.capture_combo.get(),
             "playback_device_name": self.playback_combo.get(),
             "stereo": stereo,
+            "mic_agc": agc,
+            "wasapi_exclusive": exclusive,
         })
         save_config(self.cfg)
 
-        if self.worker.start(ip, backend, cap_idx, play_idx, 2 if stereo else 1):
+        if self.worker.start(ip, backend, cap_idx, play_idx, 2 if stereo else 1, agc, exclusive):
             self.connect_btn.config(text="Disconnect")
+
+    def _latency_test(self) -> None:
+        if not self.worker.is_running() or self.worker.is_stopping():
+            self.status_var.set("Connect first, then run the latency test")
+            return
+        self.worker.request_latency_test()
 
     def _forget_ip(self) -> None:
         ip = self.ip_var.get().strip()

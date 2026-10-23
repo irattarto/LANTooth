@@ -17,6 +17,8 @@ _DEFAULTS = {
     "capture_device_name": "",
     "playback_device_name": "",
     "stereo": True,
+    "mic_agc": True,            # level the phone mic (mic_agc.py)
+    "wasapi_exclusive": False,  # exclusive-mode WASAPI playback of the phone mic
 }
 
 

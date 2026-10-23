@@ -13,16 +13,17 @@ _SOFT_CLIP_THRESHOLD = 0.9  # fraction of full scale where saturation begins
 
 # Capture -> encoder hand-off depth. The session loop drains this every few ms,
 # so it only fills if encoding stalls; keep it short so a stall can't turn into
-# permanently queued latency (8 * 20ms = 160ms worst case).
-_CAPTURE_QUEUE_FRAMES = 8
+# permanently queued latency (80ms worst case).
+_CAPTURE_QUEUE_FRAMES = 80 // FRAME_MS
 
 _WDM_KS = "Windows WDM-KS"
+_WASAPI = "Windows WASAPI"
 
 try:
     import pyaudiowpatch as _pyaudio
-    _WASAPI_AVAILABLE = True
+    WASAPI_AVAILABLE = True
 except ImportError:
-    _WASAPI_AVAILABLE = False
+    WASAPI_AVAILABLE = False
 
 
 def hostapi_name(device_index: int | None) -> str:
@@ -33,6 +34,23 @@ def hostapi_name(device_index: int | None) -> str:
         return sd.query_hostapis(sd.query_devices(device_index)["hostapi"])["name"]
     except Exception:
         return ""
+
+
+def wasapi_default_output() -> int | None:
+    """sounddevice index of the default output device's WASAPI entry. PortAudio's
+    global default is usually the MME entry, which buffers tens of ms more."""
+    try:
+        for api in sd.query_hostapis():
+            if api["name"] == _WASAPI and api["default_output_device"] >= 0:
+                return int(api["default_output_device"])
+    except Exception:
+        pass
+    return None
+
+
+def hostapi_rank(device_index: int | None) -> int:
+    """Sort key preferring the lowest-latency host API: WASAPI, then the rest."""
+    return {_WASAPI: 0, "Windows DirectSound": 1, "MME": 2}.get(hostapi_name(device_index), 3)
 
 
 def is_wdm_ks(device_index: int | None) -> bool:
@@ -277,13 +295,27 @@ class AudioPlayback:
     Pull-based rather than queue-drain: the JitterBuffer (see jitter_buffer.py)
     owns loss concealment/pacing, and this class's job is just to ask it for
     a frame exactly when the output device's callback needs one.
+
+    device=None plays on the default output's WASAPI entry rather than
+    PortAudio's default (MME). On WASAPI devices the stream is opened in shared
+    mode with automatic format conversion, or — with exclusive=True — in
+    exclusive mode, which bypasses the Windows mixer for the lowest latency but
+    locks the device for other apps; it falls back to shared if the device
+    refuses. The mono signal is duplicated onto both channels of a stereo
+    device (exclusive mode needs the device's native channel count).
     """
 
-    def __init__(self, pull_fn, device=None):
+    def __init__(self, pull_fn, device=None, exclusive: bool = False):
         self._pull_fn = pull_fn
         self._device = device
+        self._exclusive = exclusive
         self._stream: sd.OutputStream | None = None
         self._cb_error_logged = False
+
+    @property
+    def output_latency(self) -> float:
+        """Seconds of buffering in the output stream (0 when not running)."""
+        return float(self._stream.latency) if self._stream else 0.0
 
     def start(self) -> None:
         def _cb(outdata, frames, time_info, status):
@@ -292,7 +324,7 @@ class AudioPlayback:
             try:
                 pcm = np.frombuffer(self._pull_fn(), dtype=np.int16)
                 if pcm.size == frames:
-                    outdata[:, 0] = pcm
+                    outdata[:] = pcm[:, None]
                 else:
                     outdata.fill(0)
             except Exception:
@@ -301,16 +333,42 @@ class AudioPlayback:
                     self._cb_error_logged = True
                     _log.exception("playback callback failed; outputting silence")
 
-        self._stream = sd.OutputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="int16",
-            blocksize=FRAME_SAMPLES,
-            device=self._device,
-            latency="low",
-            callback=_cb,
-        )
-        self._stream.start()
+        device = self._device if self._device is not None else wasapi_default_output()
+        attempts = []
+        if hostapi_name(device) == _WASAPI:
+            if self._exclusive:
+                attempts.append((device, sd.WasapiSettings(exclusive=True), "WASAPI exclusive"))
+            attempts.append((device, sd.WasapiSettings(auto_convert=True), "WASAPI shared"))
+        else:
+            attempts.append((device, None, hostapi_name(device) or "default"))
+        if self._device is None:
+            attempts.append((None, None, "system default"))
+
+        last_error: Exception | None = None
+        for dev, extra, label in attempts:
+            try:
+                channels = 1
+                if dev is not None:
+                    channels = max(1, min(2, int(sd.query_devices(dev)["max_output_channels"])))
+                stream = sd.OutputStream(
+                    samplerate=SAMPLE_RATE,
+                    channels=channels,
+                    dtype="int16",
+                    blocksize=FRAME_SAMPLES,
+                    device=dev,
+                    latency="low",
+                    extra_settings=extra,
+                    callback=_cb,
+                )
+                stream.start()
+            except Exception as e:
+                _log.info("playback: %s open failed (%s)", label, e)
+                last_error = e
+                continue
+            self._stream = stream
+            print(f"  Playback: {label}, {stream.latency * 1000:.0f} ms output latency")
+            return
+        raise last_error or RuntimeError("no playback device")
 
     def stop(self) -> None:
         if self._stream:
@@ -336,7 +394,7 @@ def list_capture_options() -> list[tuple[str, int | None, str, bool]]:
             label = f"{dev['name']} [system audio]" if is_sys else dev["name"]
             options.append(("sd", i, label, is_sys))
 
-    if _WASAPI_AVAILABLE:
+    if WASAPI_AVAILABLE:
         try:
             pa = _pyaudio.PyAudio()
             for lb in pa.get_loopback_device_info_generator():

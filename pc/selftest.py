@@ -4,8 +4,9 @@ Offline self-tests for the PC side — no phone or audio device needed.
   python selftest.py
 
 Covers the replay window, audio payload framing, the libopus round-trip, the
-jitter buffer under simulated Wi-Fi jitter/loss/bursts/talk-spurt gaps, the
-streaming resampler's quality, and the v4 connect handshake (against an
+jitter buffer under simulated Wi-Fi jitter/loss/bursts/talk-spurt gaps/clock
+drift, the mic AGC, the latency probe's click detection, the streaming
+resampler's quality, and the v4 connect handshake (against an
 in-process fake phone: pairing code, pinning, impersonation attempts).
 """
 
@@ -24,11 +25,13 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 import codec
 from audio_engine import _FrameChunker, _downmix
 from crypto import AntiReplayWindow, derive_session_keys, confirm_mac, ready_mac, unknown_mac, commitment, pairing_code
-from jitter_buffer import JitterBuffer, FRAME_S
+from jitter_buffer import JitterBuffer, FRAME_S, MIN_DEPTH, DEFAULT_DEPTH
+from latency_probe import LatencyProbe, CLICKS, INTERVAL_S, LISTEN_S
+from mic_agc import MicAgc, LIMIT, TARGET_RMS
 from pairing import ConnectClient
 from protocol import (CONNECT_REQ, CONNECT_PENDING, CONNECT_REVEAL, CONNECT_ACCEPT, CONNECT_CONFIRM,
                       CONNECT_READY, CONNECT_UNKNOWN, CONNECT_CANCEL, pack_audio, unpack_audio, MAX_AUDIO_PAYLOAD,
-                      pack_control, unpack_control, CMD_PLAY_PAUSE, CMD_NEXT_TRACK)
+                      pack_control, unpack_control, CMD_PLAY_PAUSE, CMD_NEXT_TRACK, PROTOCOL_VERSION)
 
 _failures = 0
 
@@ -86,15 +89,17 @@ def test_codec() -> list[bytes]:
     out = b"".join(dec.decode(f) for f in frames)
     check(len(out) == len(pcm), "decode returns full frames")
     check(len(dec.conceal()) == codec.frame_bytes(1), "PLC returns a full frame")
-    senc, sdec = codec.Encoder(2, 192_000), codec.Decoder(2)
+    senc, sdec = codec.Encoder(2, 256_000), codec.Decoder(2)
     spcm = (_sine(1000, 48000, codec.FRAME_SAMPLES, 2) * 32767).astype(np.int16).tobytes()
     check(len(sdec.decode(senc.encode(spcm))) == codec.frame_bytes(2), "stereo round-trip")
     return frames
 
 
-def _simulate(frames, loss=0.0, jitter_ms=0.0, burst_every=0, burst_ms=0, gap_at=None, seed=1):
+def _simulate(frames, loss=0.0, jitter_ms=0.0, burst_every=0, burst_ms=0, gap_at=None, seed=1,
+              drift=0.0, out=None):
     """Feed `frames` through a JitterBuffer on a virtual clock; the receiver pops
-    once per 20ms tick. Returns the buffer (for its stats)."""
+    once per frame tick (the sender's clock runs `drift` faster). Returns the
+    buffer (for its stats); popped PCM is appended to `out` if given."""
     rnd = random.Random(seed)
     t_now = [0.0]
     jb = JitterBuffer(codec.Decoder(1), clock=lambda: t_now[0])
@@ -103,7 +108,7 @@ def _simulate(frames, loss=0.0, jitter_ms=0.0, burst_every=0, burst_ms=0, gap_at
     for seq, f in enumerate(frames):
         if gap_at is not None and seq == gap_at:
             send_t += 3.0  # sender pause (push-to-talk released for 3s)
-        send_t += FRAME_S
+        send_t += FRAME_S * (1.0 - drift)
         if rnd.random() < loss:
             continue
         delay = 0.005 + abs(rnd.gauss(0, jitter_ms / 1000.0))
@@ -120,7 +125,9 @@ def _simulate(frames, loss=0.0, jitter_ms=0.0, burst_every=0, burst_ms=0, gap_at
             jb.push(*arrivals[i][1:])
             i += 1
         t_now[0] = t
-        jb.pop_pcm()
+        pcm = jb.pop_pcm()
+        if out is not None:
+            out.append(pcm)
         t += FRAME_S
     return jb
 
@@ -130,7 +137,7 @@ def test_jitter_buffer(frames) -> None:
     frames = frames * 10  # 10s of audio
     jb = _simulate(frames)
     check(jb.concealed == 0 and jb.late == 0, f"clean network: nothing lost/late (target {jb.target_depth})")
-    check(jb.target_depth == 2, "clean network settles at minimum depth (40ms)")
+    check(jb.target_depth == MIN_DEPTH, f"clean network settles at minimum depth ({MIN_DEPTH * codec.FRAME_MS}ms)")
 
     # Only a loss whose NEXT packet is also lost is unrecoverable (~5% of gaps at
     # 5% loss), so ~95% is the ceiling; 30s of audio keeps the estimate stable.
@@ -140,10 +147,11 @@ def test_jitter_buffer(frames) -> None:
 
     jb = _simulate(frames, jitter_ms=15)
     late_rate = jb.late / len(frames)
-    check(late_rate < 0.02, f"15ms gaussian jitter: {late_rate:.1%} late, target {jb.target_depth * 20}ms")
+    check(late_rate < 0.02, f"15ms gaussian jitter: {late_rate:.1%} late, target {jb.target_depth * codec.FRAME_MS}ms")
 
     jb = _simulate(frames, burst_every=40, burst_ms=120)
-    check(jb.target_depth >= 6, f"120ms bursts: target grows to {jb.target_depth * 20}ms")
+    check(jb.target_depth * codec.FRAME_MS >= 120,
+          f"120ms bursts: target grows to {jb.target_depth * codec.FRAME_MS}ms")
 
     jb = _simulate(frames, gap_at=len(frames) // 2)
     check(jb.late == 0 and jb.concealed == 0, "3s talk-spurt gap: next spurt plays without loss")
@@ -158,6 +166,74 @@ def test_jitter_buffer(frames) -> None:
         jb.pop_pcm()
         t[0] += FRAME_S
     check(jb.concealed <= 2, f"1000-frame sequence jump resyncs at once ({jb.concealed} concealed)")
+
+    # Sender clock 0.3% fast (far worse than real crystals) over 30s of a
+    # continuous tone: latency has to be trimmed (never quiet, so the forced
+    # path), and every trim is crossfaded.
+    out: list[bytes] = []
+    jb = _simulate(frames * 3, drift=0.003, out=out)
+    pcm = np.frombuffer(b"".join(out), dtype=np.int16).astype(np.int32)
+    playing = pcm[np.nonzero(pcm)[0][0]:]
+    jump = int(np.abs(np.diff(playing)).max())
+    check(jb.trimmed >= 5 and jb.underruns <= 1 and len(jb._frames) <= jb.target_depth + 4,
+          f"0.3% clock drift: {jb.trimmed} frames trimmed, buffer stays near target, no underruns until the stream ends")
+    check(jump < 4000, f"trims are crossfaded (largest sample step {jump}, tone alone ~2100)")
+
+    # Fades at the edges of silence: first frame ramps in, PLC fades out.
+    t = [0.0]
+    jb = JitterBuffer(codec.Decoder(1), clock=lambda: t[0])
+    for n in range(DEFAULT_DEPTH):
+        jb.push(n, frames[n], None)
+    first = np.frombuffer(jb.pop_pcm(), dtype=np.int16)
+    check(first.any() and abs(int(first[0])) < 200 and np.abs(first[-50:]).max() > 5000,
+          f"first frame after silence fades in (starts at {first[0]})")
+    for _ in range(DEFAULT_DEPTH - 1):
+        jb.pop_pcm()
+    tail = [np.frombuffer(jb.pop_pcm(), dtype=np.int16) for _ in range(40)]
+    ends = [abs(int(f[-1])) for f in tail if f.any()]
+    check(bool(ends) and ends[-1] < 200, f"concealment fades out before silence (ends at {ends[-1] if ends else '-'})")
+
+
+def test_agc() -> None:
+    print("mic agc")
+    agc = MicAgc()
+    quiet = (_sine(300, 48000, codec.FRAME_SAMPLES * 300) * 0.05 * 32767).astype(np.int16)  # about -35 dBFS
+    out = b"".join(agc.process(quiet[i:i + codec.FRAME_SAMPLES].tobytes())
+                   for i in range(0, len(quiet), codec.FRAME_SAMPLES))
+    y = np.frombuffer(out, dtype=np.int16)[-codec.FRAME_SAMPLES * 20:].astype(np.float32) / 32768
+    rms = float(np.sqrt(np.mean(y * y)))
+    check(rms > TARGET_RMS * 0.5, f"quiet speech raised (rms {rms:.3f}, target {TARGET_RMS})")
+    loud = (_sine(300, 48000, codec.FRAME_SAMPLES * 50) * 1.9 * 32767).clip(-32768, 32767).astype(np.int16)
+    peaks = [int(np.abs(np.frombuffer(agc.process(loud[i:i + codec.FRAME_SAMPLES].tobytes()), dtype=np.int16)).max())
+             for i in range(0, len(loud), codec.FRAME_SAMPLES)]
+    peak = max(peaks[1:])  # the first frame is caught by the soft clip, the limiter takes over from the next
+    check(0 < peak <= LIMIT * 32768 * 1.01, f"sudden loud input limited (peak {peak / 32768:.2f} FS, limit {LIMIT})")
+    silence = agc.gain
+    for _ in range(100):
+        agc.process(bytes(codec.frame_bytes(1)))
+    check(agc.gain == silence, "silence does not pump the gain")
+
+
+def test_latency_probe() -> None:
+    print("latency probe")
+    t = [0.0]
+    probe = LatencyProbe(2, lambda: t[0])
+    probe.start()
+    delay = 37            # frames: 370ms round trip
+    rnd = np.random.default_rng(3)
+    line: list[bytes] = []
+    result = None
+    while result is None and t[0] < CLICKS * INTERVAL_S + LISTEN_S + 2:
+        sent = np.frombuffer(probe.outgoing(bytes(codec.frame_bytes(2))), dtype=np.int16)
+        line.append((sent[0::2] * 0.3).astype(np.int16).tobytes())   # mono, attenuated by the "air"
+        back = line[-delay - 1] if len(line) > delay else bytes(codec.frame_bytes(1))
+        noisy = np.frombuffer(back, dtype=np.int16) + rnd.normal(0, 300, codec.FRAME_SAMPLES).astype(np.int16)
+        probe.incoming(noisy.astype(np.int16).tobytes())
+        t[0] += FRAME_S
+        result = probe.poll()
+    expected = delay * codec.FRAME_MS
+    ok = probe.last_ms is not None and abs(probe.last_ms - expected) <= codec.FRAME_MS
+    check(ok, f"click found in noise: {probe.last_ms and round(probe.last_ms)} ms (expected ~{expected})")
 
 
 def test_resampler() -> None:
@@ -309,7 +385,7 @@ def test_handshake() -> None:
     check(res.send_key != res.recv_key, "the two directions use different keys")
     check(ph.get("commit_ok") is True, "PC's revealed ephemeral key matches its commitment")
     check(ph.get("confirm_ok") is True, "phone verifies the PC's CONFIRM proof")
-    check(ph["version"] == 4 and ph["channels"] == 2, "version/channels parsed at v1-compatible offsets")
+    check(ph["version"] == PROTOCOL_VERSION and ph["channels"] == 2, "version/channels parsed at v1-compatible offsets")
     check((res.android_audio_port, res.android_stream_id) == (5555, 42), "accept body parsed")
     check(len(shown) == 1 and shown[0].replace(" ", "") == ph["code"], "first pairing shows the code the phone computes")
     check(trust.is_pinned(_raw(phone_id.public_key())), "phone identity pinned after confirmation")
@@ -383,6 +459,8 @@ if __name__ == "__main__":
     test_control_framing()
     frames = test_codec()
     test_jitter_buffer(frames)
+    test_agc()
+    test_latency_probe()
     test_resampler()
     test_handshake()
     print("ALL OK" if not _failures else f"{_failures} FAILURE(S)")

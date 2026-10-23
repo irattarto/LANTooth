@@ -40,7 +40,8 @@ object Protocol {
     //       CONNECT_REQ and reveals it only after the phone's keys are known, so a
     //       man-in-the-middle cannot grind keys to force matching codes), and a
     //       CONNECT_READY key-confirmation proof from the phone
-    const val PROTOCOL_VERSION: Int = 4
+    //   v5: 10ms Opus frames (was 20ms) in both directions
+    const val PROTOCOL_VERSION: Int = 5
 
     // Connect handshake (Bluetooth-style numeric comparison on first pairing, then automatic)
     val CONNECT_REQ     = "CONNECT_REQ".toByteArray(Charsets.US_ASCII)      // PC -> phone: identity key + commitment to the ephemeral key

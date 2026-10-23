@@ -23,7 +23,9 @@ import numpy as np
 import codec
 from audio_engine import AudioCapture, WasapiLoopbackCapture, AudioPlayback
 from jitter_buffer import JitterBuffer
+from latency_probe import LatencyProbe
 from media_control import handle_control
+from mic_agc import MicAgc
 from pairing import ConnectClient, SessionResult
 from protocol import (
     pack_control, unpack_control, pack_audio, unpack_audio, CMD_KEEPALIVE, CMD_BYE,
@@ -54,7 +56,7 @@ _link_paused_at: float | None = None
 ACTIVE_PEAK = 100          # int16 units, about -50 dBFS
 ACTIVE_WINDOW_S = 5.0
 
-MEDIA_BITRATE = {1: 128_000, 2: 192_000}   # PC -> phone, by channel count
+MEDIA_BITRATE = {1: 128_000, 2: 256_000}   # PC -> phone, by channel count
 
 # DSCP EF (46) << 2: asks Wi-Fi (WMM) to use the voice access category. Windows
 # only honours it when a QoS policy allows the app to set DSCP (gpedit: Policy-
@@ -77,7 +79,7 @@ class SessionStats:
     underruns: int
     late: int
     trimmed: int
-    target_depth: int    # jitter buffer target, frames (x20ms)
+    target_depth: int    # jitter buffer target, frames (x codec.FRAME_MS)
     decode_errors: int
 
 
@@ -128,9 +130,16 @@ def stream_session(
     on_status: Callable[[str], None],
     on_stats: Callable[[SessionStats], None],
     media_channels: int = 2,
+    mic_agc: bool = True,
+    exclusive_playback: bool = False,
+    latency_test: threading.Event | None = None,
 ) -> str:
     """Run one connected streaming session until should_stop(), a BYE from the
     phone, or the link drops. Returns one of the END_* reasons.
+
+    mic_agc levels the phone's mic audio (mic_agc.py); exclusive_playback opens a
+    WASAPI playback device in exclusive mode; setting latency_test (from any
+    thread) runs one acoustic round-trip test (latency_probe.py).
 
     audio_sock ownership transfers to the UDPStream created here; stream.stop() (in
     the finally block) closes it.
@@ -178,7 +187,15 @@ def stream_session(
         capture = WasapiLoopbackCapture(device_index=capture_device, channels=media_channels)
     else:
         capture = AudioCapture(device=capture_device, channels=media_channels)
-    playback = AudioPlayback(pull_fn=jitter.pop_pcm, device=playback_device)
+    probe = LatencyProbe(media_channels, time.monotonic)
+    agc = MicAgc() if mic_agc else None
+
+    def pull_mic() -> bytes:
+        pcm = jitter.pop_pcm()
+        probe.incoming(pcm)
+        return agc.process(pcm) if agc else pcm
+
+    playback = AudioPlayback(pull_fn=pull_mic, device=playback_device, exclusive=exclusive_playback)
 
     try:
         stream.start()
@@ -221,6 +238,7 @@ def stream_session(
             if pcm:
                 if np.abs(np.frombuffer(pcm, dtype=np.int16)).max(initial=0) > ACTIVE_PEAK:
                     last_active = time.monotonic()
+                pcm = probe.outgoing(pcm)
                 try:
                     opus = encoder.encode(pcm)
                     stream.send_audio(pack_audio(seq, opus, prev_opus))
@@ -231,6 +249,18 @@ def stream_session(
                     on_status(f"Encode error: {e}")
 
             now = time.monotonic()
+
+            if latency_test is not None and latency_test.is_set() and not probe.active:
+                latency_test.clear()
+                probe.start()
+                on_status("Latency test running — phone on loudspeaker, hold Talk…")
+            result = probe.poll()
+            if result:
+                if probe.last_ms is not None:
+                    result += (f" (incl. {jitter.target_depth * codec.FRAME_MS} ms PC jitter buffer); "
+                               f"PC output adds {playback.output_latency * 1000:.0f} ms")
+                _log.info(result)
+                on_status(result)
 
             if bye_received:
                 reason = END_BYE

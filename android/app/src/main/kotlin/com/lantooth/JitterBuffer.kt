@@ -2,21 +2,27 @@ package com.lantooth
 
 import android.os.SystemClock
 import android.util.Log
+import kotlin.math.abs
 import kotlin.math.ceil
 
 private const val TAG = "LANTooth/Jitter"
 
 private const val FRAME_S = Codec.FRAME_MS / 1000.0
-private const val MIN_DEPTH = 2          // frames (40ms)
-private const val MAX_DEPTH = 8          // frames (160ms)
-private const val DEFAULT_DEPTH = 3      // until enough arrivals have been measured
-private const val PLC_FRAMES = 3         // Opus PLC ticks before fading to silence
-private const val TRIM_MARGIN = 2        // frames above target tolerated before trimming...
-private const val TRIM_AFTER_TICKS = 50  // ...for this many consecutive ticks (1s)
-private const val MAX_FRAMES = 64        // hard cap on buffered frames
-private const val TRANSIT_WINDOW = 250          // arrivals (~5s) used for the depth estimate
-private const val TARGET_UPDATE_EVERY = 25
-private const val MIN_TRANSIT_SAMPLES = 25
+private fun frames(ms: Int) = maxOf(1, ms / Codec.FRAME_MS)
+
+private val MIN_DEPTH = frames(30)           // floor for the target cushion
+private val MAX_DEPTH = frames(160)
+private val DEFAULT_DEPTH = frames(40)       // until enough arrivals have been measured
+private val PLC_FRAMES = frames(60)          // Opus PLC ticks before fading to silence
+private val TRIM_MARGIN = frames(30)         // above target tolerated before trimming...
+private val TRIM_AFTER_TICKS = frames(1000)  // ...for this long, then trim on a quiet frame...
+private val TRIM_FORCE_TICKS = frames(2000)  // ...or on any frame once it has lasted this long
+private val MAX_FRAMES = frames(1280)        // hard cap on buffered frames
+// A frame whose peak is below this (about -40 dBFS) counts as quiet.
+private const val QUIET_PEAK = 330
+private val TRANSIT_WINDOW = frames(5000)    // arrivals used for the depth estimate
+private val TARGET_UPDATE_EVERY = frames(500)
+private val MIN_TRANSIT_SAMPLES = frames(500)
 // An arrival gap this long is the SENDER pausing (PC audio went silent), not
 // network jitter — forget the old transit history, since the next burst's
 // transit times carry a new constant offset.
@@ -26,7 +32,7 @@ private const val SENDER_PAUSE_S = 1.0
  * Adaptive jitter buffer for an incoming Opus stream — same algorithm as the PC's
  * jitter_buffer.py (keep them in sync). Frames are keyed by the sender's
  * audio-only sequence number. [popPcm] is called once per playback tick (from
- * the AudioTrack writer loop), so decoding is paced by the real playback clock.
+ * the audio writer loop), so decoding is paced by the real playback clock.
  * Per tick:
  *
  *   1. Expected frame present (received directly, or recovered from the
@@ -36,10 +42,12 @@ private const val SENDER_PAUSE_S = 1.0
  *      play cursor and re-buffer up to the target depth, instead of free-running
  *      past frames that are merely late.
  *
- * Concealment is Opus PLC for the first PLC_FRAMES ticks, then silence. The
+ * Concealment is Opus PLC for the first PLC_FRAMES ticks, then silence; the last
+ * PLC frame fades out and the first real frame after silence fades in. The
  * target depth follows the ~95th percentile spread of packet transit times;
  * when the buffer sits above target for a while (burst, clock drift) one frame
- * is dropped to bring latency back down.
+ * is dropped to bring latency back down — preferably a quiet one, and always
+ * crossfaded into the next so the cut is inaudible.
  */
 class JitterBuffer(private val decoder: Codec.Decoder) {
     private val frames = HashMap<Long, ByteArray>()
@@ -47,6 +55,7 @@ class JitterBuffer(private val decoder: Codec.Decoder) {
     private var lastPlayed: Long? = null
     private var buffering = true
     private var concealRun = 0
+    private var silent = true   // last output was silence (not PLC/audio)
     private var overTicks = 0
 
     private val transits = DoubleArray(TRANSIT_WINDOW)
@@ -156,14 +165,22 @@ class JitterBuffer(private val decoder: Codec.Decoder) {
         if (redundant.remove(expected)) recovered++
         concealRun = 0
         val pcm = decode(frame)
-        maybeTrim()
-        return pcm
+        if (silent) {
+            silent = false
+            ramp(pcm, rising = true)
+        }
+        return maybeTrim(pcm)
     }
 
     private fun conceal(): ShortArray {
         concealRun++
-        if (lastPlayed == null || concealRun > PLC_FRAMES) return decoder.silence
-        return decoder.conceal()
+        if (lastPlayed == null || concealRun > PLC_FRAMES || silent) {
+            silent = true
+            return decoder.silence
+        }
+        val pcm = decoder.conceal()
+        if (concealRun == PLC_FRAMES) ramp(pcm, rising = false)
+        return pcm
     }
 
     private fun decode(frame: ByteArray): ShortArray = try {
@@ -174,18 +191,55 @@ class JitterBuffer(private val decoder: Codec.Decoder) {
         decoder.conceal()
     }
 
-    private fun maybeTrim() {
+    /** Called with the frame about to be played; returns what to play instead. */
+    private fun maybeTrim(pcm: ShortArray): ShortArray {
         if (frames.size <= targetDepth + TRIM_MARGIN) {
             overTicks = 0
-            return
+            return pcm
         }
-        if (++overTicks < TRIM_AFTER_TICKS) return
+        if (++overTicks < TRIM_AFTER_TICKS) return pcm
+        if (overTicks < TRIM_FORCE_TICKS && peak(pcm) >= QUIET_PEAK) return pcm  // wait for a pause
         overTicks = 0
-        val skip = lastPlayed!! + 1
-        val frame = frames.remove(skip)
-        redundant.remove(skip)
-        lastPlayed = skip
-        if (frame != null) decode(frame)  // keep decoder state continuous; output discarded
         trimmed++
+        val skip = lastPlayed!! + 1
+        lastPlayed = skip
+        redundant.remove(skip)
+        val next = frames.remove(skip) ?: return pcm  // skipping a missing frame costs nothing
+        return crossfade(pcm, decode(next))
+    }
+
+    /** Linear fade-in (rising) or fade-out over one interleaved frame, in place. */
+    private fun ramp(pcm: ShortArray, rising: Boolean) {
+        val ch = channels
+        val n = pcm.size / ch
+        for (i in 0 until n) {
+            val g = if (n > 1) i.toFloat() / (n - 1) else 1f
+            val gain = if (rising) g else 1f - g
+            for (c in 0 until ch) pcm[i * ch + c] = (pcm[i * ch + c] * gain).toInt().toShort()
+        }
+    }
+
+    /**
+     * One frame that starts as [a] and ends as [b]: two frames' worth of audio in
+     * one frame's time, continuous at both edges (see jitter_buffer.py _crossfade).
+     */
+    private fun crossfade(a: ShortArray, b: ShortArray): ShortArray {
+        val ch = channels
+        val n = a.size / ch
+        val out = ShortArray(a.size)
+        for (i in 0 until n) {
+            val g = if (n > 1) i.toFloat() / (n - 1) else 1f
+            for (c in 0 until ch) {
+                val k = i * ch + c
+                out[k] = (a[k] * (1f - g) + b[k] * g).toInt().coerceIn(-32768, 32767).toShort()
+            }
+        }
+        return out
+    }
+
+    private fun peak(pcm: ShortArray): Int {
+        var p = 0
+        for (s in pcm) p = maxOf(p, abs(s.toInt()))
+        return p
     }
 }

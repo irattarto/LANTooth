@@ -39,7 +39,8 @@ MAX_UDP_PAYLOAD = 1400
 #       man-in-the-middle cannot grind keys to force matching codes), and a
 #       CONNECT_READY key-confirmation proof from the phone, so the PC only
 #       starts a session with a peer that really derived the session keys
-PROTOCOL_VERSION = 4
+#   v5: 10ms Opus frames (was 20ms) in both directions
+PROTOCOL_VERSION = 5
 
 # Connect handshake (Bluetooth-style numeric comparison on first pairing, then automatic)
 CONNECT_REQ     = b"CONNECT_REQ"      # PC -> phone: identity key + COMMITMENT to the ephemeral key

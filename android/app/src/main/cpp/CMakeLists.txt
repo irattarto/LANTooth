@@ -34,3 +34,8 @@ target_compile_options(opus PRIVATE -O2)
 target_compile_options(lantooth_opus PRIVATE -O2 -Wall)
 # Keep libopus internal: only the Java_* JNI entry points are exported.
 target_link_options(lantooth_opus PRIVATE -Wl,--exclude-libs,ALL)
+
+# AAudio (NDK low-latency audio) bridge for NativeAAudio.kt / AudioEngine.kt.
+add_library(lantooth_audio SHARED aaudio_jni.c)
+target_link_libraries(lantooth_audio PRIVATE aaudio)
+target_compile_options(lantooth_audio PRIVATE -O2 -Wall)

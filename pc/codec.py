@@ -24,8 +24,11 @@ import os
 import sys
 
 SAMPLE_RATE   = 48_000
-FRAME_MS      = 20
-FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000   # 960 samples per channel per frame
+# 10ms (Mumble's low-latency setting): half the packetization delay of 20ms, and
+# the jitter buffer can size its cushion in finer steps. CELT is still transparent
+# at our bitrates; the cost is 100 packets/s instead of 50, irrelevant on a LAN.
+FRAME_MS      = 10
+FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000   # 480 samples per channel per frame
 
 MIC_CHANNELS = 1   # phone -> PC (speech)
 
@@ -137,7 +140,7 @@ _MAX_PACKET = 1500
 class Encoder:
     """One Opus encoder instance (create one per session so no state leaks across)."""
 
-    def __init__(self, channels: int = 1, bitrate: int = 128_000, complexity: int = 8):
+    def __init__(self, channels: int = 1, bitrate: int = 128_000, complexity: int = 10):
         lib = _get_lib()
         err = ctypes.c_int(0)
         self._ptr = lib.opus_encoder_create(
@@ -182,7 +185,7 @@ class Decoder:
         if err.value != _OK or not self._ptr:
             raise RuntimeError(f"opus_decoder_create failed: {err.value}")
         self._lib = lib
-        self._channels = channels
+        self.channels = channels
         self._out = (ctypes.c_short * (FRAME_SAMPLES * channels))()
         self.silence = bytes(frame_bytes(channels))
 
@@ -191,9 +194,9 @@ class Decoder:
             self._ptr, data, len(data) if data else 0, self._out, FRAME_SAMPLES, 0)
 
     def _pcm(self, n: int) -> bytes:
-        pcm = ctypes.string_at(self._out, n * 2 * self._channels)
-        if n < FRAME_SAMPLES:  # never expected with fixed 20ms frames, but keep the size invariant
-            pcm += bytes((FRAME_SAMPLES - n) * 2 * self._channels)
+        pcm = ctypes.string_at(self._out, n * 2 * self.channels)
+        if n < FRAME_SAMPLES:  # never expected with fixed-size frames, but keep the size invariant
+            pcm += bytes((FRAME_SAMPLES - n) * 2 * self.channels)
         return pcm
 
     def decode(self, data: bytes) -> bytes:

@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.3.0] — 2026-10-23 (test release)
+
+Lower latency and better sound. **Protocol v5: update the PC app and the phone
+app together.**
+- Audio is sent in 10 ms frames instead of 20 ms, in both directions.
+- PC: plays the phone mic through WASAPI instead of the old default (MME). On
+  the test machine output buffering dropped from 100 ms to 23 ms. A new
+  "Exclusive mode" option lowers it to about 13 ms but locks the device for
+  other apps. The device lists put WASAPI entries first, and the default PC
+  audio source is now the WASAPI loopback of the default output.
+- Phone: plays and records through AAudio, Android's low-latency audio path.
+  The playback buffer starts as small as possible and grows only when the phone
+  underruns. Falls back to AudioTrack/AudioRecord when AAudio isn't available.
+- PC: new "Auto-level the phone mic" option (AGC + limiter), on by default.
+- PC: new "Latency test" button. Sends five clicks to the phone and measures
+  the round trip through the phone's speaker and mic.
+- Both: the jitter buffer cuts latency on quiet frames, crossfading each cut.
+  Fades out instead of cutting to silence after a dropout, and fades back in.
+- Opus complexity raised to 10; PC → phone stereo bitrate raised from 192 to
+  256 kbit/s.
+
 ## [0.2.4] — 2026-10-09
 
 - PC: when the connection to the phone is lost while PC audio is playing, sends

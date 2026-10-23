@@ -17,13 +17,18 @@ network arrival timing. Per tick:
 
 Concealment is Opus PLC for the first PLC_FRAMES ticks, then plain silence —
 PLC stretched over a long gap (e.g. push-to-talk release) turns into an audible
-decaying buzz.
+decaying buzz. The last PLC frame is faded out and the first real frame after
+silence faded in, so neither edge clicks.
 
 Depth adapts to the network: the target is derived from the spread of packet
 transit times over the last few seconds (roughly its 95th percentile, in frames,
 plus one). When the buffer sits above target for a while (a burst arrived, or
 sender/receiver clock drift accumulated) one frame is dropped to bring the
-latency back down.
+latency back down — preferably during a quiet frame, and always crossfaded into
+the following one so the cut is inaudible.
+
+All depths/durations are given in milliseconds and converted to frames, so they
+stay the same if codec.FRAME_MS changes.
 """
 
 import collections
@@ -32,27 +37,62 @@ import math
 import threading
 import time
 
+import numpy as np
+
 import codec
 
 _log = logging.getLogger(__name__)
 
 FRAME_S = codec.FRAME_MS / 1000.0
 
-MIN_DEPTH = 2          # frames (40ms)
-MAX_DEPTH = 8          # frames (160ms)
-DEFAULT_DEPTH = 3      # until enough arrivals have been measured
-PLC_FRAMES = 3         # Opus PLC ticks before fading to silence
-TRIM_MARGIN = 2        # frames above target tolerated before trimming...
-TRIM_AFTER_TICKS = 50  # ...for this many consecutive ticks (1s)
-MAX_FRAMES = 64        # hard cap on buffered frames
 
-TRANSIT_WINDOW = 250          # arrivals (~5s) used for the depth estimate
-TARGET_UPDATE_EVERY = 25      # recompute target every N arrivals
-MIN_TRANSIT_SAMPLES = 25
+def _frames(ms: int) -> int:
+    return max(1, ms // codec.FRAME_MS)
+
+
+MIN_DEPTH = _frames(30)          # floor for the target cushion
+MAX_DEPTH = _frames(160)
+DEFAULT_DEPTH = _frames(40)      # until enough arrivals have been measured
+PLC_FRAMES = _frames(60)         # Opus PLC ticks before fading to silence
+TRIM_MARGIN = _frames(30)        # above target tolerated before trimming...
+TRIM_AFTER_TICKS = _frames(1000)  # ...for this long, then trim on a quiet frame...
+TRIM_FORCE_TICKS = _frames(2000)  # ...or on any frame once it has lasted this long
+MAX_FRAMES = _frames(1280)       # hard cap on buffered frames
+
+# A frame whose peak is below this (int16, about -40 dBFS) counts as quiet:
+# dropping it is inaudible even before the crossfade.
+QUIET_PEAK = 330
+
+TRANSIT_WINDOW = _frames(5000)   # arrivals used for the depth estimate
+TARGET_UPDATE_EVERY = _frames(500)  # recompute target every N arrivals
+MIN_TRANSIT_SAMPLES = _frames(500)
 # An arrival gap this long is the SENDER pausing (push-to-talk release, loopback
 # silence), not network jitter — forget the old transit history, since the next
 # talk spurt's transit times carry a new constant offset.
 SENDER_PAUSE_S = 1.0
+
+
+def _ramp(pcm: bytes, channels: int, rising: bool) -> bytes:
+    """Linear fade-in (rising) or fade-out over one interleaved int16 frame."""
+    x = np.frombuffer(pcm, dtype=np.int16).reshape(-1, channels).astype(np.float32)
+    g = np.linspace(0.0, 1.0, len(x), dtype=np.float32)
+    if not rising:
+        g = g[::-1]
+    return (x * g[:, None]).astype(np.int16).tobytes()
+
+
+def _crossfade(a: bytes, b: bytes, channels: int) -> bytes:
+    """One frame that starts as `a` and ends as `b`: plays two frames' worth of
+    audio in one frame's time without a discontinuity at either edge (it begins
+    where the frame before `a` left off and ends where the frame after `b` starts)."""
+    x = np.frombuffer(a, dtype=np.int16).reshape(-1, channels).astype(np.float32)
+    y = np.frombuffer(b, dtype=np.int16).reshape(-1, channels).astype(np.float32)
+    g = np.linspace(0.0, 1.0, len(x), dtype=np.float32)[:, None]
+    return np.clip(x * (1.0 - g) + y * g, -32768, 32767).astype(np.int16).tobytes()
+
+
+def _peak(pcm: bytes) -> int:
+    return int(np.abs(np.frombuffer(pcm, dtype=np.int16).astype(np.int32)).max(initial=0))
 
 
 class JitterBuffer:
@@ -66,6 +106,7 @@ class JitterBuffer:
         self._last_played: int | None = None
         self._buffering = True
         self._conceal_run = 0
+        self._silent = True                 # last output was silence (not PLC/audio)
         self._over_ticks = 0
 
         self._transits: collections.deque[float] = collections.deque(maxlen=TRANSIT_WINDOW)
@@ -156,14 +197,20 @@ class JitterBuffer:
                 self.recovered += 1
             self._conceal_run = 0
             pcm = self._decode(frame)
-            self._maybe_trim()
-            return pcm
+            if self._silent:
+                self._silent = False
+                pcm = _ramp(pcm, self._dec.channels, rising=True)
+            return self._maybe_trim(pcm)
 
     def _conceal(self) -> bytes:
         self._conceal_run += 1
-        if self._last_played is None or self._conceal_run > PLC_FRAMES:
+        if self._last_played is None or self._conceal_run > PLC_FRAMES or self._silent:
+            self._silent = True
             return self._dec.silence
-        return self._dec.conceal()
+        pcm = self._dec.conceal()
+        if self._conceal_run == PLC_FRAMES:
+            pcm = _ramp(pcm, self._dec.channels, rising=False)
+        return pcm
 
     def _decode(self, frame: bytes) -> bytes:
         try:
@@ -173,18 +220,22 @@ class JitterBuffer:
             _log.warning("decode failed: %s", e)
             return self._dec.conceal()
 
-    def _maybe_trim(self) -> None:
+    def _maybe_trim(self, pcm: bytes) -> bytes:
+        """Called with the frame about to be played; returns what to play instead."""
         if len(self._frames) <= self.target_depth + TRIM_MARGIN:
             self._over_ticks = 0
-            return
+            return pcm
         self._over_ticks += 1
         if self._over_ticks < TRIM_AFTER_TICKS:
-            return
+            return pcm
+        if self._over_ticks < TRIM_FORCE_TICKS and _peak(pcm) >= QUIET_PEAK:
+            return pcm  # wait for a pause in the audio
         self._over_ticks = 0
-        skip = self._last_played + 1
-        frame = self._frames.pop(skip, None)
-        self._redundant.discard(skip)
-        self._last_played = skip
-        if frame is not None:
-            self._decode(frame)  # keep decoder state continuous; output discarded
         self.trimmed += 1
+        skip = self._last_played + 1
+        self._last_played = skip
+        self._redundant.discard(skip)
+        frame = self._frames.pop(skip, None)
+        if frame is None:
+            return pcm  # skipping a missing frame costs nothing
+        return _crossfade(pcm, self._decode(frame), self._dec.channels)

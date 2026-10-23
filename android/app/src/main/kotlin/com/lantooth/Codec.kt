@@ -11,8 +11,9 @@ package com.lantooth
  */
 object Codec {
     const val SAMPLE_RATE = 48_000
-    const val FRAME_MS = 20
-    const val FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS / 1000   // 960 per channel
+    // 10ms: half the packetization delay of 20ms, finer jitter-buffer steps (see codec.py)
+    const val FRAME_MS = 10
+    const val FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS / 1000   // 480 per channel
     const val MIC_CHANNELS = 1                                 // phone -> PC
 
     val libraryVersion: String get() = NativeOpus.version()
@@ -25,7 +26,7 @@ object Codec {
         private var handle = NativeOpus.encoderCreate(
             SAMPLE_RATE, channels, NativeOpus.APPLICATION_RESTRICTED_LOWDELAY,
             bitrate = 128_000,
-            complexity = 8,
+            complexity = 10,
             // In CELT mode this tones down the pitch pre-filter so a lost packet
             // propagates less error into the following frames.
             lossPercent = 10,

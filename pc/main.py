@@ -9,6 +9,9 @@ Usage:
   python main.py --playback M             # use playback device M for Android mic audio,
                                            #   skipping the interactive picker
   python main.py --mono                   # send mono instead of stereo to the phone
+  python main.py --no-agc                 # play the phone mic without auto-levelling
+  python main.py --exclusive              # exclusive-mode WASAPI playback (lowest latency)
+  python main.py --latency-test           # measure the round trip once connected
   python main.py --version                # protocol + libopus version (checks the DLL loads)
 """
 
@@ -16,8 +19,10 @@ import argparse
 import ipaddress
 import socket
 import sys
+import threading
 import time
 
+import codec
 from appdata import setup_logging
 from audio_engine import list_capture_options, list_playback_options, list_devices
 from config import load_config, remember_ip
@@ -178,7 +183,7 @@ def _print_stats(stats: SessionStats) -> None:
     print(f"  [stats] sent_to_phone={stats.sent}  "
           f"from_phone_mic: received={stats.received} recovered={stats.recovered} "
           f"concealed={stats.concealed} underruns={stats.underruns} late={stats.late} "
-          f"trimmed={stats.trimmed} buffer={stats.target_depth * 20}ms "
+          f"trimmed={stats.trimmed} buffer={stats.target_depth * codec.FRAME_MS}ms "
           f"decode_errors={stats.decode_errors}")
 
 
@@ -200,12 +205,17 @@ def main() -> None:
                         help="Playback device for Android mic audio (skips the interactive picker)")
     parser.add_argument("--mono", action="store_true",
                         help="Send mono instead of stereo to the phone")
+    parser.add_argument("--no-agc", action="store_true",
+                        help="Play the phone mic as-is, without auto-levelling")
+    parser.add_argument("--exclusive", action="store_true",
+                        help="Exclusive-mode WASAPI playback of the phone mic (lowest latency)")
+    parser.add_argument("--latency-test", action="store_true",
+                        help="Measure the round trip once connected (phone on loudspeaker, hold Talk)")
     parser.add_argument("--version", action="store_true",
                         help="Print protocol and libopus versions and exit")
     args = parser.parse_args()
 
     if args.version:
-        import codec
         try:
             opus = codec.libopus_version()
         except OSError as e:
@@ -258,6 +268,7 @@ def main() -> None:
         print()
         capture_backend, capture_device = _select_capture(args)
         playback_device = _select_playback(args)
+        latency_test = threading.Event()
 
         while True:
             # 3. Connect handshake
@@ -273,6 +284,8 @@ def main() -> None:
                 continue
 
             remember_ip(cfg, android_ip)
+            if args.latency_test:
+                latency_test.set()
             print(f"  Connected! Android audio port: {session.android_audio_port}")
             print()
 
@@ -289,6 +302,9 @@ def main() -> None:
                 on_status=_print_status,
                 on_stats=_print_stats,
                 media_channels=media_channels,
+                mic_agc=not args.no_agc,
+                exclusive_playback=args.exclusive,
+                latency_test=latency_test,
             )
             print()
             if reason in (END_BYE, END_ERROR):
