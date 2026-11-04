@@ -217,7 +217,9 @@ class ControlActivity : AppCompatActivity() {
     }
 
     private fun micLabel(device: AudioDeviceInfo): String = when (device.type) {
-        AudioDeviceInfo.TYPE_BUILTIN_MIC     -> "Built-in microphone"
+        // Phones with several built-in mics tell them apart by address ("bottom", "back").
+        AudioDeviceInfo.TYPE_BUILTIN_MIC     ->
+            device.address.takeIf { it.isNotEmpty() }?.let { "Built-in microphone ($it)" } ?: "Built-in microphone"
         AudioDeviceInfo.TYPE_WIRED_HEADSET   -> "Wired headset mic"
         AudioDeviceInfo.TYPE_USB_DEVICE,
         AudioDeviceInfo.TYPE_USB_HEADSET     -> "USB mic (${device.productName})"

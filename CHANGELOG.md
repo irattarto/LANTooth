@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.2] — 2026-11-04 (test release)
+
+- Phone: the mic picker names built-in mics by position where the phone reports
+  it, for example "Built-in microphone (back)", instead of showing identical
+  entries. Only the phone app changed.
+
 ## [0.4.1] — 2026-11-04 (test release)
 
 Fixes the phone mic not reaching the PC. Only the phone app changed; the protocol
