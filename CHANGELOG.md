@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.1] — 2026-11-04 (test release)
+
+Fixes the phone mic not reaching the PC. Only the phone app changed; the protocol
+is still v6, so a 0.4.0 PC app works with the 0.4.1 phone app.
+- Phone: the mic picker listed every input the phone reports, including Telephony
+  Rx, FM Tuner and Remote Submix, which normal apps aren't allowed to record.
+  Selecting one left the session connected but with no mic audio and no error. The
+  picker now lists only real microphones, and a saved selection that isn't one
+  resets to System default.
+- Phone: the speaker picker no longer lists Telephony Tx, FM or Remote Submix.
+- Phone: capture no longer restarts when the mic picker re-reports the current
+  selection, which opened the mic twice when connecting.
+
 ## [0.4.0] — 2026-11-04 (test release)
 
 Steadier sound on Wi-Fi without extra latency. **Protocol v6: update the PC app

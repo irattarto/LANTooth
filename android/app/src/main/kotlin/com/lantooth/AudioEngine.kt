@@ -25,6 +25,21 @@ private const val IO_TIMEOUT_NS = 100_000_000L
 private const val ZERO_INPUT_GIVE_UP_SAMPLES = Codec.SAMPLE_RATE * 2 * 2  // 2s stereo
 private const val SOURCE_BLOCKED = -2
 
+private val MIC_DEVICE_TYPES = setOf(
+    AudioDeviceInfo.TYPE_BUILTIN_MIC,
+    AudioDeviceInfo.TYPE_WIRED_HEADSET,
+    AudioDeviceInfo.TYPE_USB_DEVICE,
+    AudioDeviceInfo.TYPE_USB_HEADSET,
+    AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+)
+
+// Outputs the system reports that aren't something to listen on.
+private val NON_LISTENING_OUTPUT_TYPES = setOf(
+    AudioDeviceInfo.TYPE_TELEPHONY,
+    AudioDeviceInfo.TYPE_FM,
+    AudioDeviceInfo.TYPE_REMOTE_SUBMIX,
+)
+
 /** An audio output, opened, used and closed by the playback thread only. */
 private interface PcmSink : AutoCloseable {
     /** Writes one frame; false = device lost, reopen. */
@@ -161,9 +176,14 @@ class AudioEngine(context: Context) {
     @Volatile private var aaudioInputBlocked = false
     private val captureQueue = ArrayBlockingQueue<ShortArray>(8)
 
-    /** List available microphone-like input devices for a picker UI. */
+    /**
+     * Actual microphones, for the picker UI. The system also reports inputs like
+     * Telephony Rx, FM Tuner and Remote Submix, which only system apps may capture:
+     * selecting one makes every capture attempt fail ("capture not allowed").
+     * A saved selection that isn't in this list falls back to the system default.
+     */
     fun listInputDevices(): List<AudioDeviceInfo> =
-        audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).toList()
+        audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).filter { it.type in MIC_DEVICE_TYPES }
 
     /**
      * Select which input device future startCapture() calls should prefer.
@@ -171,6 +191,8 @@ class AudioEngine(context: Context) {
      */
     @Synchronized
     fun setPreferredInputDevice(device: AudioDeviceInfo?) {
+        // The picker re-reports its selection whenever it is populated; don't restart for that.
+        if (device?.id == preferredInputDevice?.id) return
         preferredInputDevice = device
         if (captureRunning != null) startCapture()
     }
@@ -308,7 +330,7 @@ class AudioEngine(context: Context) {
 
     /** List available speaker/output-like devices for a picker UI. */
     fun listOutputDevices(): List<AudioDeviceInfo> =
-        audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).toList()
+        audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).filter { it.type !in NON_LISTENING_OUTPUT_TYPES }
 
     /**
      * Select which output device future startPlayback() calls should prefer.
