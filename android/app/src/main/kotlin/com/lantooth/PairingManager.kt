@@ -33,13 +33,13 @@ private const val READY_COPIES = 5
 private const val READY_SPACING_MS = 30L
 
 /**
- * Server-side connect handshake (protocol v4) — Bluetooth-style numeric
+ * Server-side connect handshake (protocol v6) — Bluetooth-style numeric
  * comparison on first pairing, automatic afterwards.
  *
  * Android is the server: waits for a PC's CONNECT_REQ on PAIRING_PORT.
  *
  *   1. Receive CONNECT_REQ: pc_identity_pub(32) + commitment(32) + pc_audio_port(2) +
- *      pc_stream_id(4) + pc_protocol_version(1) + name_len(1) + pc_name + media_channels(1).
+ *      pc_stream_id(4) + pc_protocol_version(1) + name_len(1) + pc_name + media_channels(1) + dscp(1).
  *      The commitment is SHA-256 of the PC's ephemeral key, which the PC reveals
  *      only later — see [CryptoEngine.commitment].
  *   2. A protocol version mismatch gets an immediate CONNECT_REJECT (no prompt).
@@ -50,7 +50,9 @@ private const val READY_SPACING_MS = 30L
  *   4. Unknown PC: its CONNECT_REVEAL opens the commitment; only then is the 8-digit
  *      code (from both identity keys and both ephemeral keys) shown with Accept/Reject.
  *      Accepting stores the PC's identity in the trust store. Reject/timeout:
- *      CONNECT_REJECT and a cooldown.
+ *      CONNECT_REJECT (with a MAC, so it can't be forged against the PC) and a
+ *      cooldown. The PC's CONNECT_CANCEL (its user declined the code) carries a
+ *      MAC too, so a bystander can't use it to get the PC put on that cooldown.
  *   5. The session starts only on a valid CONNECT_CONFIRM — an HMAC, under a key
  *      that needs BOTH private identity keys, over the whole transcript. A replayed
  *      or spoofed CONNECT_REQ (the identity public key is visible on the LAN) can at
@@ -78,6 +80,7 @@ class PairingManager(context: Context, private val scope: CoroutineScope) {
         val pcIp: String,
         val pcName: String,
         val mediaChannels: Int,
+        val dscp: Int,              // Wi-Fi priority the PC asks for
     )
 
     private class Handshake(
@@ -91,6 +94,7 @@ class PairingManager(context: Context, private val scope: CoroutineScope) {
         val pcStreamId: Int,
         val name: String,
         val mediaChannels: Int,
+        val dscp: Int,
         val createdAt: Long,
     ) {
         /** The PC's ephemeral key, set once a CONNECT_REVEAL / CONNECT_CONFIRM matching [commitment] arrives. */
@@ -144,9 +148,12 @@ class PairingManager(context: Context, private val scope: CoroutineScope) {
                 } else {
                     rejectedRecently[idHex] = System.currentTimeMillis()
                     runCatching {
+                        val keys = CryptoEngine.deriveSessionKeys(
+                            identity.privateKey, hs.phEphPriv, hs.pcId, pcEph, identity.publicKey, hs.phEphPub,
+                        )
                         val reply = Protocol.CONNECT_REJECT + byteArrayOf(
                             Protocol.REJECT_REASON_USER, Protocol.PROTOCOL_VERSION.toByte(),
-                        )
+                        ) + hs.phEphPub + CryptoEngine.rejectMac(keys, hs.pcId, pcEph, identity.publicKey, hs.phEphPub)
                         sock.send(DatagramPacket(reply, reply.size, addr, port))
                     }
                     Log.d(TAG, "Rejected $ip ($name)")
@@ -204,7 +211,9 @@ class PairingManager(context: Context, private val scope: CoroutineScope) {
                     Thread.sleep(READY_SPACING_MS)
                 }
                 Log.d(TAG, "Session established with $ip (${hs.name})")
-                return@withContext SessionInfo(keys.phoneToPc, keys.pcToPhone, hs.pcAudioPort, hs.pcStreamId, ip, hs.name, hs.mediaChannels)
+                return@withContext SessionInfo(
+                    keys.phoneToPc, keys.pcToPhone, hs.pcAudioPort, hs.pcStreamId, ip, hs.name, hs.mediaChannels, hs.dscp,
+                )
             }
 
             // ---- PC no longer knows us: drop our trust, re-pair with a code ----------
@@ -246,12 +255,18 @@ class PairingManager(context: Context, private val scope: CoroutineScope) {
                 continue
             }
 
-            // ---- PC's user declined the code ---------------------------------------
+            // ---- PC's user declined the code (authenticated) -----------------------
             if (Protocol.startsWithTag(data, Protocol.CONNECT_CANCEL)) {
                 val body = data.copyOfRange(Protocol.CONNECT_CANCEL.size, data.size)
-                if (body.size < 32) continue
-                val hs = handshakes[body.copyOfRange(0, 32).toHexString()] ?: continue
-                if (pkt.address == hs.addr) resolvePending(hs.idHex, false)
+                if (body.size < 64) continue
+                val pcEph = body.copyOfRange(0, 32)
+                val hs = handshakes[CryptoEngine.commitment(pcEph).toHexString()] ?: continue
+                if (pkt.address != hs.addr) continue
+                val keys = try {
+                    CryptoEngine.deriveSessionKeys(identity.privateKey, hs.phEphPriv, hs.pcId, pcEph, identity.publicKey, hs.phEphPub)
+                } catch (e: Exception) { continue }
+                val expected = CryptoEngine.cancelMac(keys, hs.pcId, pcEph, identity.publicKey, hs.phEphPub)
+                if (MessageDigest.isEqual(expected, body.copyOfRange(32, 64))) resolvePending(hs.idHex, false)
                 continue
             }
 
@@ -271,6 +286,7 @@ class PairingManager(context: Context, private val scope: CoroutineScope) {
             bb.get(nameBytes)
             val pcName = sanitizeName(nameBytes.toString(Charsets.UTF_8))
             val mediaChannels = if (bb.hasRemaining()) (bb.get().toInt() and 0xFF).coerceIn(1, 2) else 1
+            val dscp = if (bb.hasRemaining()) (bb.get().toInt() and 0xFF).coerceIn(0, 63) else Protocol.DEFAULT_DSCP
             val idHex = identityPub.toHexString()
 
             if (pcProtocolVersion != Protocol.PROTOCOL_VERSION) {
@@ -308,7 +324,7 @@ class PairingManager(context: Context, private val scope: CoroutineScope) {
                 }
                 val priv = CryptoEngine.generateX25519PrivateKey()
                 hs = Handshake(pkt.address, idHex, identityPub, commitment, priv, CryptoEngine.x25519PublicKey(priv),
-                    pcAudioPort, pcStreamId, pcName, mediaChannels, now)
+                    pcAudioPort, pcStreamId, pcName, mediaChannels, dscp, now)
                 handshakes[commitHex] = hs
             }
 

@@ -4,10 +4,11 @@ Offline self-tests for the PC side — no phone or audio device needed.
   python selftest.py
 
 Covers the replay window, audio payload framing, the libopus round-trip, the
-jitter buffer under simulated Wi-Fi jitter/loss/bursts/talk-spurt gaps/clock
-drift, the mic AGC, the latency probe's click detection, the streaming
-resampler's quality, and the v4 connect handshake (against an
-in-process fake phone: pairing code, pinning, impersonation attempts).
+jitter buffer under simulated Wi-Fi jitter/loss/bursts/stalls/talk-spurt
+gaps/clock drift, link reports and the send adaptation they drive, the mic AGC,
+the latency probe's click detection, the streaming resampler's quality, and the
+v6 connect handshake (against an in-process fake phone: pairing code, pinning,
+impersonation attempts, authenticated cancel/reject).
 """
 
 import math
@@ -24,14 +25,19 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 import codec
 from audio_engine import _FrameChunker, _downmix
-from crypto import AntiReplayWindow, derive_session_keys, confirm_mac, ready_mac, unknown_mac, commitment, pairing_code
+from crypto import (AntiReplayWindow, derive_session_keys, confirm_mac, ready_mac, unknown_mac, cancel_mac, reject_mac,
+                    commitment, pairing_code)
+import pairing
 from jitter_buffer import JitterBuffer, FRAME_S, MIN_DEPTH, DEFAULT_DEPTH
+from link_quality import LinkMeter, SendAdapter, STEREO_BITRATES, UP_AFTER_S
 from latency_probe import LatencyProbe, CLICKS, INTERVAL_S, LISTEN_S
 from mic_agc import MicAgc, LIMIT, TARGET_RMS
 from pairing import ConnectClient
 from protocol import (CONNECT_REQ, CONNECT_PENDING, CONNECT_REVEAL, CONNECT_ACCEPT, CONNECT_CONFIRM,
-                      CONNECT_READY, CONNECT_UNKNOWN, CONNECT_CANCEL, pack_audio, unpack_audio, MAX_AUDIO_PAYLOAD,
-                      pack_control, unpack_control, CMD_PLAY_PAUSE, CMD_NEXT_TRACK, PROTOCOL_VERSION)
+                      CONNECT_READY, CONNECT_UNKNOWN, CONNECT_CANCEL, CONNECT_REJECT, pack_audio, unpack_audio,
+                      MAX_AUDIO_PAYLOAD, pack_control, unpack_control, CMD_PLAY_PAUSE, CMD_NEXT_TRACK, CMD_REPORT,
+                      PROTOCOL_VERSION, REJECT_REASON_USER, REJECT_REASON_VERSION_MISMATCH, LinkReport,
+                      pack_report, unpack_report)
 
 _failures = 0
 
@@ -60,12 +66,19 @@ def test_replay_window() -> None:
 
 def test_audio_framing() -> None:
     print("audio framing")
-    seq, cur, prev = unpack_audio(pack_audio(7, b"abc", b"xy"))
-    check((seq, cur, prev) == (7, b"abc", b"xy"), "round-trip with redundancy")
-    check(unpack_audio(pack_audio(8, b"abc", None))[2] is None, "round-trip without redundancy")
-    big = bytes(800)
-    check(len(pack_audio(1, big, big)) <= MAX_AUDIO_PAYLOAD, "oversized redundancy is dropped")
-    check(unpack_audio(b"\x00\x00\x00\x01\x00\x09abc") is None, "truncated payload rejected")
+    check(unpack_audio(pack_audio(7, [b"abc", b"xy", b"q"])) == (7, [b"abc", b"xy", b"q"]),
+          "round-trip with two redundant frames")
+    check(unpack_audio(pack_audio(8, [b"abc"])) == (8, [b"abc"]), "round-trip without redundancy")
+    check(len(unpack_audio(pack_audio(9, [b"a"] * 9))[1]) == 4, "at most 3 redundant frames")
+    big = bytes(600)
+    packed = pack_audio(1, [big, big, big])
+    check(len(packed) <= MAX_AUDIO_PAYLOAD and len(unpack_audio(packed)[1]) == 2,
+          "redundancy that doesn't fit is dropped")
+    check(unpack_audio(b"\x00\x00\x00\x01\x01\x00\x09abc") is None, "truncated payload rejected")
+    check(unpack_audio(b"\x00\x00\x00\x01\x00") is None, "frame-less payload rejected")
+    r = LinkReport(loss_permille=37, max_burst=4, stalls=1, late=2, concealed=3, target_ms=50)
+    data = pack_report(r)
+    check(unpack_control(data)[0] == CMD_REPORT and unpack_report(data) == r, "link report round-trip")
 
 
 def test_control_framing() -> None:
@@ -95,27 +108,42 @@ def test_codec() -> list[bytes]:
     return frames
 
 
-def _simulate(frames, loss=0.0, jitter_ms=0.0, burst_every=0, burst_ms=0, gap_at=None, seed=1,
-              drift=0.0, out=None):
+def _simulate(frames, loss=0.0, jitter_ms=0.0, burst_every=0, burst_ms=0, gap_at=None, gap_s=3.0, seed=1,
+              drift=0.0, out=None, stall_every=0, stall_ms=0, loss_burst_every=0, loss_burst=0,
+              redundancy=1):
     """Feed `frames` through a JitterBuffer on a virtual clock; the receiver pops
-    once per frame tick (the sender's clock runs `drift` faster). Returns the
-    buffer (for its stats); popped PCM is appended to `out` if given."""
+    once per frame tick (the sender's clock runs `drift` faster). The sender's
+    seq follows real time, so a pause (gap_at, gap_s) skips seq numbers. Every
+    stall_every frames the network holds packets back for stall_ms (a Wi-Fi
+    scan/power-save stall), every loss_burst_every frames loss_burst packets in a
+    row are lost. Returns the buffer (for its stats); popped PCM is appended to
+    `out` if given."""
     rnd = random.Random(seed)
     t_now = [0.0]
     jb = JitterBuffer(codec.Decoder(1), clock=lambda: t_now[0])
     arrivals = []
     send_t = 0.0
-    for seq, f in enumerate(frames):
-        if gap_at is not None and seq == gap_at:
-            send_t += 3.0  # sender pause (push-to-talk released for 3s)
+    seq_offset = 0
+    for n, f in enumerate(frames):
+        if gap_at is not None and n == gap_at:
+            send_t += gap_s  # sender pause (push-to-talk released); seq keeps counting
+            seq_offset += round(gap_s / FRAME_S)
         send_t += FRAME_S * (1.0 - drift)
+        seq = n + seq_offset
         if rnd.random() < loss:
             continue
+        if loss_burst_every and n % loss_burst_every < loss_burst and n > loss_burst_every:
+            continue
         delay = 0.005 + abs(rnd.gauss(0, jitter_ms / 1000.0))
-        if burst_every and seq % burst_every < burst_every // 4:
+        if burst_every and n % burst_every < burst_every // 4:
             delay += burst_ms / 1000.0  # Wi-Fi power-save style batching
-        prev = frames[seq - 1] if seq else None
-        arrivals.append((send_t + delay, seq, f, prev))
+        if stall_every and n > stall_every:
+            # Packets sent during the stall are all released when it ends.
+            into = (n % stall_every) * FRAME_S
+            if into < stall_ms / 1000.0:
+                delay += stall_ms / 1000.0 - into
+        older = [frames[n - 1 - i] for i in range(redundancy) if n - 1 - i >= 0 and (gap_at is None or n - 1 - i >= gap_at or n < gap_at)]
+        arrivals.append((send_t + delay, seq, f, older))
     arrivals.sort()
     i, t = 0, 0.0
     end = arrivals[-1][0] + 1.0
@@ -156,13 +184,32 @@ def test_jitter_buffer(frames) -> None:
     jb = _simulate(frames, gap_at=len(frames) // 2)
     check(jb.late == 0 and jb.concealed == 0, "3s talk-spurt gap: next spurt plays without loss")
 
+    # Push-to-talk released for half a second (shorter than SENDER_PAUSE_S): the
+    # seq jump says it was a pause, so it must not look like 500ms of network
+    # delay (that used to push the buffer to its 160ms maximum).
+    jb = _simulate(frames, gap_at=len(frames) // 2, gap_s=0.5)
+    check(jb.stalls == 0 and jb.target_depth == MIN_DEPTH and jb.late == 0,
+          f"0.5s sender pause: no stall, target stays {jb.target_depth * codec.FRAME_MS}ms")
+
+    # A 60ms Wi-Fi stall every 2s: too rare for the 95th percentile, so each one
+    # used to be an underrun. The first stall raises the target; later ones are covered.
+    jb = _simulate(frames * 2, stall_every=200, stall_ms=60)
+    check(jb.stalls >= 1 and jb.underruns <= 2 and jb.target_depth * codec.FRAME_MS >= 60,
+          f"periodic 60ms stalls: {jb.underruns} underruns over 10 stalls, target {jb.target_depth * codec.FRAME_MS}ms")
+
+    # Bursts of 3 lost packets: one redundant frame can't bring them back, three can.
+    jb1 = _simulate(frames * 2, loss_burst_every=50, loss_burst=3, redundancy=1)
+    jb3 = _simulate(frames * 2, loss_burst_every=50, loss_burst=3, jitter_ms=2, redundancy=3)
+    check(jb1.concealed > 50 and jb3.concealed == 0,
+          f"3-packet loss bursts: {jb1.concealed} concealed with 1x redundancy, {jb3.concealed} with 3x")
+
     # Sequence jump without an arrival gap (receiver stopped consuming while the
     # sender kept going, e.g. Mic-only -> Headset on the phone).
     t = [0.0]
     jb = JitterBuffer(codec.Decoder(1), clock=lambda: t[0])
     for n in range(200):
         seq = n if n < 100 else n + 1000
-        jb.push(seq, frames[n], frames[n - 1] if n else None)
+        jb.push(seq, frames[n], [frames[n - 1]] if n else [])
         jb.pop_pcm()
         t[0] += FRAME_S
     check(jb.concealed <= 2, f"1000-frame sequence jump resyncs at once ({jb.concealed} concealed)")
@@ -183,7 +230,7 @@ def test_jitter_buffer(frames) -> None:
     t = [0.0]
     jb = JitterBuffer(codec.Decoder(1), clock=lambda: t[0])
     for n in range(DEFAULT_DEPTH):
-        jb.push(n, frames[n], None)
+        jb.push(n, frames[n])
     first = np.frombuffer(jb.pop_pcm(), dtype=np.int16)
     check(first.any() and abs(int(first[0])) < 200 and np.abs(first[-50:]).max() > 5000,
           f"first frame after silence fades in (starts at {first[0]})")
@@ -192,6 +239,47 @@ def test_jitter_buffer(frames) -> None:
     tail = [np.frombuffer(jb.pop_pcm(), dtype=np.int16) for _ in range(40)]
     ends = [abs(int(f[-1])) for f in tail if f.any()]
     check(bool(ends) and ends[-1] < 200, f"concealment fades out before silence (ends at {ends[-1] if ends else '-'})")
+
+
+def test_link_quality() -> None:
+    print("link quality")
+    m = LinkMeter()
+    for c in [0, 1, 2, 5, 6, 3, 10]:   # 4, 7, 8, 9 lost; 3 arrives late
+        m.packet(c)
+    loss, burst = m.snapshot()
+    check(abs(loss - 4 / 11) < 1e-9 and burst == 3, f"loss {loss:.2f} and longest burst {burst} from counter gaps")
+    m.packet(11)
+    check(m.snapshot() == (0.0, 0), "next interval starts fresh")
+
+    t = [0.0]
+    a = SendAdapter(STEREO_BITRATES, clock=lambda: t[0])
+
+    def report(loss_pm=0, burst=0, stalls=0, target_ms=60):
+        a.on_report(LinkReport(loss_pm, burst, stalls, 0, 0, target_ms))
+        t[0] += 0.5
+
+    report()
+    check(a.bitrate == STEREO_BITRATES[0] and a.redundancy == 1 and a.loss_hint == 1, "clean link: full quality")
+    report(burst=3)
+    check(a.redundancy == 3, "3-packet burst: three redundant frames")
+    report(burst=3, target_ms=20)
+    check(a.redundancy == 1, "...but never more than the receiver's buffer can use")
+    report(burst=2)
+    for _ in range(5):
+        report()
+    check(a.redundancy == 2, "extra redundancy is held after the last burst")
+    for _ in range(25):
+        report()
+    check(a.redundancy == 1, "...and released once bursts stop")
+    for _ in range(12):
+        report(loss_pm=150)
+    check(a.bitrate == STEREO_BITRATES[-1] and a.loss_hint > 10, f"15% loss: bitrate steps down to {a.bitrate // 1000}k")
+    for _ in range(int(UP_AFTER_S / 0.5) + 10):
+        report()
+    check(STEREO_BITRATES[-1] < a.bitrate, "clean again: steps back up")
+    for _ in range(int(3 * UP_AFTER_S / 0.5)):
+        report()
+    check(a.bitrate == STEREO_BITRATES[0], "...back to full quality")
 
 
 def test_agc() -> None:
@@ -264,11 +352,20 @@ def _raw(pub) -> bytes:
     return pub.public_bytes(Encoding.Raw, PublicFormat.Raw)
 
 
+def _phone_keys(eph, phone_id, pc_id, pc_eph):
+    pc_id_k, pc_eph_k = X25519PublicKey.from_public_bytes(pc_id), X25519PublicKey.from_public_bytes(pc_eph)
+    return derive_session_keys(eph.exchange(pc_eph_k), eph.exchange(pc_id_k),
+                               phone_id.exchange(pc_eph_k), phone_id.exchange(pc_id_k),
+                               pc_id, pc_eph, _raw(phone_id.public_key()), _raw(eph.public_key()))
+
+
 def _fake_phone(sock: socket.socket, phone_id: X25519PrivateKey, results: dict,
-                pending: bool = False, rogue_first: bool = False, trusts_pc: bool = False) -> None:
-    """In-process v4 phone. REQ -> PENDING (if `pending`, i.e. it doesn't know the
+                pending: bool = False, rogue_first: bool = False, trusts_pc: bool = False,
+                reject: str | None = None) -> None:
+    """In-process v6 phone. REQ -> PENDING (if `pending`, i.e. it doesn't know the
     PC yet) or ACCEPT; REVEAL is checked against the commitment; a valid CONFIRM
-    is answered with READY."""
+    is answered with READY. reject="user" rejects after REVEAL (authenticated),
+    reject="spoof" makes a bystander send forged rejects first."""
     eph = X25519PrivateKey.generate()
     ph_eph, ph_id = _raw(eph.public_key()), _raw(phone_id.public_key())
     sock.settimeout(4)
@@ -281,6 +378,7 @@ def _fake_phone(sock: socket.socket, phone_id: X25519PrivateKey, results: dict,
                 state["pc_id"], state["commit"] = body[:32], body[32:64]
                 name_len = body[71]
                 results["channels"] = body[72 + name_len]
+                results["dscp"] = body[73 + name_len]
                 results["version"] = body[70]
                 if state["pending"] and "pc_eph" not in state:
                     sock.sendto(CONNECT_PENDING + ph_id + ph_eph, addr)
@@ -298,6 +396,18 @@ def _fake_phone(sock: socket.socket, phone_id: X25519PrivateKey, results: dict,
                 if results["commit_ok"]:
                     state["pc_eph"] = pc_eph
                     results["code"] = pairing_code(state["pc_id"], pc_eph, ph_id, ph_eph)
+                    if reject == "user":
+                        keys = _phone_keys(eph, phone_id, state["pc_id"], pc_eph)
+                        sock.sendto(CONNECT_REJECT + bytes([REJECT_REASON_USER, PROTOCOL_VERSION]) + ph_eph
+                                    + reject_mac(keys, state["pc_id"], pc_eph, ph_id, ph_eph), addr)
+                        return
+                    if reject == "spoof" and not results.get("spoofed"):
+                        results["spoofed"] = True
+                        rogue = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        rogue.sendto(CONNECT_REJECT + bytes([REJECT_REASON_USER, PROTOCOL_VERSION]) + ph_eph
+                                     + bytes(32), addr)
+                        rogue.sendto(CONNECT_REJECT + bytes([REJECT_REASON_VERSION_MISMATCH, 5]), addr)
+                        rogue.close()
             elif data.startswith(CONNECT_CONFIRM):
                 pc_eph = data[len(CONNECT_CONFIRM):][:32]
                 if commitment(pc_eph) != state.get("commit"):
@@ -329,7 +439,13 @@ def _fake_phone(sock: socket.socket, phone_id: X25519PrivateKey, results: dict,
                     results["code"] = pairing_code(pc_id, pc_eph, ph_id, ph_eph)
                     sock.sendto(CONNECT_PENDING + ph_id + ph_eph, addr)
             elif data.startswith(CONNECT_CANCEL):
-                results["cancelled"] = data[len(CONNECT_CANCEL):][:32] == state.get("commit")
+                body = data[len(CONNECT_CANCEL):]
+                pc_eph = body[:32]
+                ok = commitment(pc_eph) == state.get("commit")
+                if ok:
+                    keys = _phone_keys(eph, phone_id, state["pc_id"], pc_eph)
+                    ok = hmac.compare_digest(body[32:64], cancel_mac(keys, state["pc_id"], pc_eph, ph_id, ph_eph))
+                results["cancelled"] = ok
                 return
     except socket.timeout:
         pass
@@ -343,11 +459,12 @@ class _MemTrust:
     def pin(self, i): self.ids.add(i)
 
 
-def _handshake(pc_priv, phone_id, trust, confirm, claimed=None, pending=False, rogue_first=False, timeout=5, trusts_pc=False):
+def _handshake(pc_priv, phone_id, trust, confirm, claimed=None, pending=False, rogue_first=False, timeout=5,
+               trusts_pc=False, reject=None):
     phone = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     phone.bind(("127.0.0.1", 0))
     results: dict = {}
-    t = threading.Thread(target=_fake_phone, args=(phone, phone_id, results, pending, rogue_first, trusts_pc))
+    t = threading.Thread(target=_fake_phone, args=(phone, phone_id, results, pending, rogue_first, trusts_pc, reject))
     t.start()
 
     class _Claim:  # public key of one identity, private key of another (an impersonator)
@@ -361,7 +478,7 @@ def _handshake(pc_priv, phone_id, trust, confirm, claimed=None, pending=False, r
     res = None
     try:
         res = ConnectClient(trust, confirm).connect("127.0.0.1", phone.getsockname()[1], _Claim(),
-                                                    1234, 99, "test", media_channels=2, timeout=timeout)
+                                                    1234, 99, "test", media_channels=2, timeout=timeout, dscp=46)
     except RuntimeError as e:
         err = e
     t.join()
@@ -370,7 +487,7 @@ def _handshake(pc_priv, phone_id, trust, confirm, claimed=None, pending=False, r
 
 
 def test_handshake() -> None:
-    print("v4 handshake")
+    print("v6 handshake")
     pc, phone_id = X25519PrivateKey.generate(), X25519PrivateKey.generate()
     trust = _MemTrust()
     shown: list[str] = []
@@ -385,7 +502,8 @@ def test_handshake() -> None:
     check(res.send_key != res.recv_key, "the two directions use different keys")
     check(ph.get("commit_ok") is True, "PC's revealed ephemeral key matches its commitment")
     check(ph.get("confirm_ok") is True, "phone verifies the PC's CONFIRM proof")
-    check(ph["version"] == PROTOCOL_VERSION and ph["channels"] == 2, "version/channels parsed at v1-compatible offsets")
+    check(ph["version"] == PROTOCOL_VERSION and ph["channels"] == 2 and ph["dscp"] == 46,
+          "version/channels/dscp parsed at v1-compatible offsets")
     check((res.android_audio_port, res.android_stream_id) == (5555, 42), "accept body parsed")
     check(len(shown) == 1 and shown[0].replace(" ", "") == ph["code"], "first pairing shows the code the phone computes")
     check(trust.is_pinned(_raw(phone_id.public_key())), "phone identity pinned after confirmation")
@@ -404,7 +522,43 @@ def test_handshake() -> None:
     check(res is None and err is not None and ph.get("cancelled"), "different phone at the same IP is refused when the code is declined")
 
     res, ph, err = _handshake(pc, phone_id, _MemTrust(), lambda c: False, pending=True)
-    check(res is None and ph.get("cancelled"), "declining the code cancels the pairing")
+    check(res is None and ph.get("cancelled"), "declining the code cancels the pairing (authenticated)")
+
+    res, ph, err = _handshake(pc, X25519PrivateKey.generate(), _MemTrust(), yes, pending=True, reject="user")
+    check(res is None and err is not None and "rejected" in str(err), "phone's authenticated reject ends the attempt")
+
+    res, ph, err = _handshake(pc, X25519PrivateKey.generate(), _MemTrust(), yes, pending=True, reject="spoof")
+    check(err is None and res is not None and ph.get("spoofed"),
+          "forged user reject and version-mismatch reject from a bystander are ignored")
+
+    # A phone that really speaks another version only ever answers with the
+    # (unauthenticated) mismatch reject: believed after the grace period.
+    old = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    old.bind(("127.0.0.1", 0))
+    old.settimeout(0.2)
+    stop_old = threading.Event()
+
+    def old_phone():
+        while not stop_old.is_set():
+            try:
+                _, addr = old.recvfrom(512)
+            except (socket.timeout, OSError):
+                continue
+            old.sendto(CONNECT_REJECT + bytes([REJECT_REASON_VERSION_MISMATCH, 5]), addr)
+
+    t_old = threading.Thread(target=old_phone)
+    t_old.start()
+    grace, pairing.MISMATCH_GRACE_S = pairing.MISMATCH_GRACE_S, 0.5
+    err = None
+    try:
+        ConnectClient(_MemTrust(), yes).connect("127.0.0.1", old.getsockname()[1], pc, 1234, 99, "test", timeout=5)
+    except RuntimeError as e:
+        err = e
+    pairing.MISMATCH_GRACE_S = grace
+    stop_old.set()
+    t_old.join()
+    old.close()
+    check(err is not None and "v5" in str(err), "a phone on another protocol version is reported as a mismatch")
 
     # An impersonator that replays the PC's identity public key without its private key
     res, ph, err = _handshake(X25519PrivateKey.generate(), phone_id, trust, yes, claimed=pc, timeout=2)
@@ -459,6 +613,7 @@ if __name__ == "__main__":
     test_control_framing()
     frames = test_codec()
     test_jitter_buffer(frames)
+    test_link_quality()
     test_agc()
     test_latency_probe()
     test_resampler()

@@ -32,6 +32,26 @@ as [VB-CABLE](https://vb-audio.com/Cable/). In LANTooth, choose *CABLE Input*
 as the phone-mic output. In Discord, Zoom or similar, pick *CABLE Output* as
 the microphone.
 
+## Better sound on Wi-Fi
+
+LANTooth measures the connection while it streams. When packets get lost it
+repeats recent audio in later packets, and on a bad link it lowers the bitrate
+until the link is clean again. Your network setup still matters most:
+
+- **Use 5 GHz Wi-Fi** for the phone, and keep it within good range of the
+  router or access point.
+- **Keep WMM enabled** on the router (usually on by default). It provides the
+  priority queues used below.
+- **Wi-Fi priority:** in the PC app, press **Set up…** next to *Wi-Fi priority
+  mark* once (needs administrator rights). The access point then sends the PC's
+  audio to the phone ahead of other traffic, and the phone marks its mic audio
+  the same way. Keep the recommended value 48 unless your router documents a
+  different voice mapping; then try 46.
+- **On the phone, turn off Wi-Fi scanning** (Settings → Location → Location
+  services → Wi-Fi scanning). Background scans pause the Wi-Fi radio for 100–300 ms.
+- The PC stats line shows packet loss, bitrate and stalls for each direction.
+  Steady loss above a few percent means the Wi-Fi link is weak.
+
 ## Build from source
 
 | Part | Requirements | Command |
@@ -40,6 +60,7 @@ the microphone.
 | PC installer | the above plus [Inno Setup 6](https://jrsoftware.org/isinfo.php) | `... pc\build_exe.ps1 -Installer` |
 | Android APK | Android SDK. Gradle downloads the NDK and CMake itself. | `cd android && gradlew assembleDebug` |
 | PC self-test | — | `pc\.venv\Scripts\python pc\selftest.py` |
+| Android unit tests | Android SDK | `cd android && gradlew testDebugUnitTest` |
 
 To run the PC app from source: `pip install -r pc/requirements.txt`, then
 `python pc/gui.py` (GUI) or `python pc/main.py --help` (CLI).

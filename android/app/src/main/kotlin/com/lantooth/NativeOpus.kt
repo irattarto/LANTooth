@@ -20,6 +20,8 @@ object NativeOpus {
         bitrate: Int, complexity: Int, lossPercent: Int,
     ): Long
     @JvmStatic external fun encode(handle: Long, pcm: ShortArray, frameSize: Int, out: ByteArray): Int
+    @JvmStatic external fun encoderSetBitrate(handle: Long, bitrate: Int): Int
+    @JvmStatic external fun encoderSetLossPercent(handle: Long, percent: Int): Int
     @JvmStatic external fun encoderDestroy(handle: Long)
 
     /** Returns 0 on failure. */

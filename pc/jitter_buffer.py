@@ -6,8 +6,8 @@ every audio payload. pop_pcm() is called once per playback tick (from the audio
 output callback), so decoding is paced by the real playback clock rather than
 network arrival timing. Per tick:
 
-  1. Expected frame present (received directly, or recovered from the redundant
-     copy the NEXT packet carries)                         -> decode it.
+  1. Expected frame present (received directly, or recovered from a redundant
+     copy one of the next packets carries)                 -> decode it.
   2. Missing, but later frames are buffered (a real loss)  -> conceal, move on.
   3. Nothing buffered at all (underrun: the sender paused, or the network
      delivered late)                                       -> conceal, but HOLD
@@ -22,7 +22,13 @@ silence faded in, so neither edge clicks.
 
 Depth adapts to the network: the target is derived from the spread of packet
 transit times over the last few seconds (roughly its 95th percentile, in frames,
-plus one). When the buffer sits above target for a while (a burst arrived, or
+plus one). The sender's seq advances with real time even while it sends nothing,
+so a pause in its audio is a seq jump, not apparent network delay. An underrun
+the network caused (the packets arriving while we wait came later than the
+cushion could cover) is a stall: short periodic Wi-Fi stalls fall under that
+percentile, so the target is raised at once to cover the stall that happened,
+and held for PEAK_HOLD_S after the last one. After a sender pause the packets
+arrive on time again, so a pause never raises the target. When the buffer sits above target for a while (a burst arrived, or
 sender/receiver clock drift accumulated) one frame is dropped to bring the
 latency back down — preferably during a quiet frame, and always crossfaded into
 the following one so the cut is inaudible.
@@ -50,7 +56,7 @@ def _frames(ms: int) -> int:
     return max(1, ms // codec.FRAME_MS)
 
 
-MIN_DEPTH = _frames(30)          # floor for the target cushion
+MIN_DEPTH = _frames(20)          # floor for the target cushion
 MAX_DEPTH = _frames(160)
 DEFAULT_DEPTH = _frames(40)      # until enough arrivals have been measured
 PLC_FRAMES = _frames(60)         # Opus PLC ticks before fading to silence
@@ -70,6 +76,8 @@ MIN_TRANSIT_SAMPLES = _frames(500)
 # silence), not network jitter — forget the old transit history, since the next
 # talk spurt's transit times carry a new constant offset.
 SENDER_PAUSE_S = 1.0
+# How long a stall keeps the target raised to the depth that would have covered it.
+PEAK_HOLD_S = 20.0
 
 
 def _ramp(pcm: bytes, channels: int, rising: bool) -> bytes:
@@ -113,6 +121,11 @@ class JitterBuffer:
         self._last_arrival: float | None = None
         self._since_target = 0
         self.target_depth = DEFAULT_DEPTH
+        self._percentile_depth = DEFAULT_DEPTH
+        self._peak_depth = 0
+        self._peak_until = float("-inf")
+        self._in_underrun = False    # ran dry while playing, not refilled yet
+        self._stall_seen = False     # ...and arrivals since showed it was the network
 
         self.received = 0
         self.recovered = 0      # frames played from the redundant copy
@@ -120,15 +133,23 @@ class JitterBuffer:
         self.underruns = 0
         self.late = 0           # arrived after their play slot
         self.trimmed = 0        # dropped to cut latency
+        self.stalls = 0         # underruns caused by late packets (not a sender pause)
         self.decode_errors = 0
 
     # ── network side ─────────────────────────────────────────────────────────
 
-    def push(self, seq: int, opus: bytes, prev_opus: bytes | None = None) -> None:
+    def push(self, seq: int, opus: bytes, older: "list[bytes] | tuple[bytes, ...]" = ()) -> None:
+        """Frame `seq`, plus redundant copies of the frames before it (older[i] is seq - 1 - i)."""
         now = self._clock()
         with self._lock:
             self.received += 1
             self._track_arrival(seq, now)
+            if self._in_underrun:
+                # Ran dry: held back by the network if this packet's transit exceeds
+                # the fastest recent one by more than the cushion we had.
+                excess = self._transits[-1] - min(self._transits)
+                if excess > self.target_depth * FRAME_S:
+                    self._on_stall(now, excess)
 
             lp = self._last_played
             if lp is not None and seq <= lp:
@@ -137,10 +158,13 @@ class JitterBuffer:
             self._frames[seq] = opus
             self._redundant.discard(seq)
 
-            prev = seq - 1
-            if prev_opus and (lp is None or prev > lp) and prev not in self._frames:
-                self._frames[prev] = prev_opus
-                self._redundant.add(prev)
+            for i, frame in enumerate(older):
+                s = seq - 1 - i
+                if lp is not None and s <= lp:
+                    break
+                if s not in self._frames:
+                    self._frames[s] = frame
+                    self._redundant.add(s)
 
             if len(self._frames) > MAX_FRAMES:
                 for k in sorted(self._frames)[:len(self._frames) - MAX_FRAMES]:
@@ -158,7 +182,23 @@ class JitterBuffer:
             self._since_target = 0
             s = sorted(self._transits)
             spread = s[int(0.95 * (len(s) - 1))] - s[0]
-            self.target_depth = max(MIN_DEPTH, min(MAX_DEPTH, math.ceil(spread / FRAME_S) + 1))
+            self._percentile_depth = max(MIN_DEPTH, min(MAX_DEPTH, math.ceil(spread / FRAME_S) + 1))
+            self._update_target(now)
+
+    def _on_stall(self, now: float, excess: float) -> None:
+        """An arrival `excess` s later than the fastest recent one ended an underrun: cover that."""
+        if not self._stall_seen:
+            self._stall_seen = True
+            self.stalls += 1
+        # +2: one frame for the playback tick's phase against arrivals, one of margin.
+        depth = min(MAX_DEPTH, math.ceil(excess / FRAME_S) + 2)
+        self._peak_depth = depth if now >= self._peak_until else max(self._peak_depth, depth)
+        self._peak_until = now + PEAK_HOLD_S
+        self._update_target(now)
+
+    def _update_target(self, now: float) -> None:
+        peak = self._peak_depth if now < self._peak_until else 0
+        self.target_depth = max(self._percentile_depth, peak)
 
     # ── playback side ────────────────────────────────────────────────────────
 
@@ -168,6 +208,7 @@ class JitterBuffer:
                 if len(self._frames) < self.target_depth:
                     return self._conceal()
                 self._buffering = False
+                self._in_underrun = False
                 first = min(self._frames)
                 if self._last_played is None or first > self._last_played + 1:
                     self._last_played = first - 1
@@ -186,6 +227,8 @@ class JitterBuffer:
                 if not self._frames:
                     self.underruns += 1
                     self._buffering = True
+                    self._in_underrun = True
+                    self._stall_seen = False
                     return self._conceal()
                 self.concealed += 1
                 self._last_played = expected

@@ -11,6 +11,7 @@ import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineExceptionHandler
@@ -25,7 +26,9 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.security.SecureRandom
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.roundToInt
 
 private const val TAG = "LANTooth/Stream"
 private const val NOTIF_ID = 1
@@ -46,9 +49,11 @@ private const val PREF_OUTPUT_ID = "output_id"
 private const val KEEPALIVE_INTERVAL_MS = 1000L
 private const val LIVENESS_TIMEOUT_MS = 6000L
 
-// DSCP EF (46) << 2: puts our packets in Wi-Fi's WMM voice access category, which
-// gets priority airtime on a busy network.
-private const val TOS_EF = 0xB8
+// A gap this long between captured frames means capture stopped delivering (mic
+// reopening after a route change): advance the audio seq by the time that passed,
+// so the PC sees a pause instead of a burst of network delay. Shorter gaps are
+// ordinary read jitter; the capture queue holds at most 80ms.
+private const val SEQ_GAP_MS = 100L
 
 enum class StreamMode { HEADSET, MIC_ONLY }
 
@@ -115,9 +120,9 @@ class StreamService : Service() {
     private var audioSocket: DatagramSocket? = null
 
     // Streaming session state
-    // sessionKey is the phone -> PC key (null = no session); recvKey the PC -> phone key.
-    @Volatile private var sessionKey: ByteArray? = null
-    @Volatile private var recvKey: ByteArray? = null
+    // sendCipher is the phone -> PC key (null = no session); recvCipher the PC -> phone key.
+    @Volatile private var sendCipher: CryptoEngine.PacketCipher? = null
+    @Volatile private var recvCipher: CryptoEngine.PacketCipher? = null
     @Volatile private var pcIp: String = ""
     @Volatile private var pcAddr: InetAddress? = null
     @Volatile private var pcAudioPort: Int = 0
@@ -127,6 +132,9 @@ class StreamService : Service() {
     // A fresh window per session: the PC's send counter restarts at 0 every session,
     // so a window carried over from the previous one would reject all of it.
     @Volatile private var replayWindow = CryptoEngine.AntiReplayWindow()
+    @Volatile private var linkMeter = LinkMeter()   // loss of the PC -> phone stream, for our reports
+    // The PC's reports on our mic stream; applied by the send loop, which owns the encoder.
+    private val pcReports = ConcurrentLinkedQueue<Protocol.LinkReport>()
 
     @Volatile private var mode: StreamMode = StreamMode.HEADSET
     // Push-to-talk only: mic starts muted and is active only while held.
@@ -214,8 +222,8 @@ class StreamService : Service() {
     override fun onBind(intent: Intent): IBinder = binder
 
     override fun onDestroy() {
-        if (sessionKey != null) sendBye()
-        sessionKey = null
+        if (sendCipher != null) sendBye()
+        sendCipher = null
         // Cancel the send/recv loop coroutines FIRST — closing sockets and releasing
         // audio while they're still running races them against this cleanup (they'll
         // hit a closed socket or an already-stopped AudioRecord and throw).
@@ -237,7 +245,7 @@ class StreamService : Service() {
             // Fresh audio socket each cycle so port numbers are unpredictable
             audioSocket?.close()
             val sock = DatagramSocket(0).apply {
-                runCatching { trafficClass = TOS_EF }
+                runCatching { trafficClass = Protocol.DEFAULT_DSCP shl 2 }
                 receiveBufferSize = 64 * 1024
             }
             audioSocket = sock
@@ -267,11 +275,15 @@ class StreamService : Service() {
             theirStreamId = session.pcStreamId
             sendCounter.set(0)
             replayWindow = CryptoEngine.AntiReplayWindow()
+            linkMeter = LinkMeter()
+            pcReports.clear()
+            // DSCP -> WMM: the priority the PC asked for (its access-point mapping is the one tested).
+            runCatching { sock.trafficClass = session.dscp shl 2 }
             val decoder = Codec.Decoder(session.mediaChannels)
             val jb = JitterBuffer(decoder)
             jitterBuffer = jb
-            recvKey = session.recvKey
-            sessionKey = session.sendKey
+            recvCipher = CryptoEngine.PacketCipher(session.recvKey)
+            sendCipher = CryptoEngine.PacketCipher(session.sendKey)
 
             acquireLocks()
             isConnected = true
@@ -288,8 +300,8 @@ class StreamService : Service() {
             recvJob.join()
 
             Log.d(TAG, "Disconnected from ${session.pcIp} (${playbackStats(jb)})")
-            sessionKey = null
-            recvKey = null
+            sendCipher = null
+            recvCipher = null
             jitterBuffer = null
             audio.stopPlayback()  // playback thread must be gone before the decoder is freed
             decoder.close()
@@ -312,7 +324,7 @@ class StreamService : Service() {
 
     private fun playbackStats(jb: JitterBuffer) =
         "received=${jb.received} recovered=${jb.recovered} concealed=${jb.concealed} " +
-            "underruns=${jb.underruns} late=${jb.late} trimmed=${jb.trimmed} " +
+            "underruns=${jb.underruns} stalls=${jb.stalls} late=${jb.late} trimmed=${jb.trimmed} " +
             "target=${jb.targetDepth * Codec.FRAME_MS}ms decodeErrors=${jb.decodeErrors}"
 
     // ---------------------------------------------------------------------------
@@ -321,29 +333,61 @@ class StreamService : Service() {
 
     private fun runSendLoop() {
         audio.startCapture()
-        val encoder = Codec.Encoder()
+        val adapter = SendAdapter(MIC_BITRATES)
+        val encoder = Codec.Encoder(bitrate = adapter.bitrate)
         var sentCount = 0
+        // Audio frames carry their own sequence number, separate from the transport
+        // counter (which also numbers control/keepalive packets). It counts captured
+        // 10ms frames — muted ones too — so it follows real time and a push-to-talk
+        // pause is a seq jump the PC's jitter buffer can tell from network delay.
         var audioSeq = 0
-        var prevOpus: ByteArray? = null
+        val history = ArrayDeque<ByteArray>()   // sent frames audioSeq-1, audioSeq-2, ...
+        var lastFrameAtMs = 0L
         var lastStatsLog = System.currentTimeMillis()
         var lastKeepaliveAtMs = System.currentTimeMillis()
         try {
             while (true) {
-                val key = sessionKey ?: break
+                val cipher = sendCipher ?: break
                 val pcm = audio.readCapture(50)
-                if (pcm != null && micActive) {
-                    try {
-                        val opus = encoder.encode(pcm)
-                        // Audio frames carry their own sequence number, separate from the
-                        // transport counter (which also numbers control/keepalive packets) —
-                        // the jitter buffer needs a gap-free audio-only sequence to detect
-                        // loss; interleaved control packets would otherwise look like drops.
-                        sendPacket(key, Protocol.TYPE_AUDIO_ANDROID_TO_PC, Protocol.packAudio(audioSeq++, opus, prevOpus))
-                        prevOpus = opus
-                        sentCount++
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Send error: ${e.message}")
+                if (pcm != null) {
+                    val gotAt = SystemClock.elapsedRealtime()
+                    if (lastFrameAtMs != 0L && gotAt - lastFrameAtMs > SEQ_GAP_MS) {
+                        // Capture stopped delivering: those frame slots passed unsent.
+                        audioSeq += ((gotAt - lastFrameAtMs).toDouble() / Codec.FRAME_MS).roundToInt() - 1
+                        history.clear()
                     }
+                    lastFrameAtMs = gotAt
+                    if (micActive) {
+                        try {
+                            val opus = encoder.encode(pcm)
+                            val frames = ArrayList<ByteArray>(1 + adapter.redundancy).apply {
+                                add(opus)
+                                for (i in 0 until minOf(adapter.redundancy, history.size)) add(history[i])
+                            }
+                            sendPacket(cipher, Protocol.TYPE_AUDIO_ANDROID_TO_PC, Protocol.packAudio(audioSeq, frames))
+                            history.addFirst(opus)
+                            if (history.size > Protocol.MAX_REDUNDANCY) history.removeLast()
+                            sentCount++
+                        } catch (e: Exception) {
+                            history.clear()
+                            Log.w(TAG, "Send error: ${e.message}")
+                        }
+                    } else {
+                        history.clear()   // muted frames are not sent, so they can't be repeated either
+                    }
+                    audioSeq++
+                }
+
+                while (true) {
+                    val report = pcReports.poll() ?: break
+                    val bitrate = adapter.bitrate
+                    val hint = adapter.lossHint
+                    adapter.onReport(report)
+                    if (adapter.bitrate != bitrate) {
+                        encoder.setBitrate(adapter.bitrate)
+                        Log.i(TAG, "Mic bitrate ${adapter.bitrate / 1000} kbps (PC reports ${"%.1f".format(adapter.peerLoss * 100)}% loss)")
+                    }
+                    if (adapter.lossHint != hint) encoder.setLossHint(adapter.lossHint)
                 }
 
                 val now = System.currentTimeMillis()
@@ -356,7 +400,9 @@ class StreamService : Service() {
 
                 if (now - lastStatsLog >= 3000) {
                     lastStatsLog = now
-                    Log.d(TAG, "Mic send stats: sentToPc=$sentCount micActive=$micActive")
+                    Log.d(TAG, "Mic send stats: sentToPc=$sentCount micActive=$micActive " +
+                        "bitrate=${adapter.bitrate / 1000}k redundancy=${adapter.redundancy} " +
+                        "pcLoss=${"%.1f".format(adapter.peerLoss * 100)}%")
                 }
             }
         } catch (e: Exception) {
@@ -374,16 +420,21 @@ class StreamService : Service() {
 
         val buf = ByteArray(2048)
         val datagram = DatagramPacket(buf, buf.size)
-        sock.soTimeout = 500
+        sock.soTimeout = Protocol.REPORT_INTERVAL_MS.toInt()
+        val meter = linkMeter
         var lastStatsLog = System.currentTimeMillis()
         var lastRecvAtMs = System.currentTimeMillis()
+        var lastReportAtMs = System.currentTimeMillis()
+        var reportedLate = 0
+        var reportedConcealed = 0
+        var reportedStalls = 0
 
         try {
             while (true) {
-                if (sessionKey == null) break
+                if (sendCipher == null) break
                 if (System.currentTimeMillis() - lastRecvAtMs > LIVENESS_TIMEOUT_MS) {
                     Log.w(TAG, "No traffic from PC for ${LIVENESS_TIMEOUT_MS}ms — treating as disconnected")
-                    sessionKey = null
+                    sendCipher = null
                     break
                 }
                 try {
@@ -391,38 +442,60 @@ class StreamService : Service() {
                     sock.receive(datagram)
                     if (datagram.address != pcAddr) continue
 
-                    val pkt = Protocol.unpack(buf, datagram.length) ?: continue
+                    val pkt = Protocol.unpackHeader(buf, datagram.length) ?: continue
                     if (pkt.streamId != theirStreamId) continue
                     if (!replayWindow.check(pkt.counter)) continue
-                    val plain = CryptoEngine.decryptPacket(
-                        recvKey ?: break, pkt.streamId, pkt.counter, pkt.type, pkt.payload
+                    val plain = (recvCipher ?: break).decrypt(
+                        pkt.streamId, pkt.counter, pkt.type, buf, pkt.payloadOffset, pkt.payloadLength,
                     ) ?: continue
                     // Only authenticated packets may advance the replay window or
                     // count as liveness.
                     replayWindow.commit(pkt.counter)
+                    meter.packet(pkt.counter)
                     lastRecvAtMs = System.currentTimeMillis()
 
                     when (pkt.type) {
                         Protocol.TYPE_AUDIO_PC_TO_ANDROID -> {
-                            if (mode != StreamMode.HEADSET) continue  // not playing, nothing to buffer
-                            val frame = Protocol.unpackAudio(plain) ?: continue
-                            jb.push(frame.seq, frame.cur, frame.prev)
+                            if (mode == StreamMode.HEADSET) {  // otherwise not playing, nothing to buffer
+                                val frame = Protocol.unpackAudio(plain)
+                                if (frame != null) jb.push(frame.seq, frame.frames[0], frame.frames.subList(1, frame.frames.size))
+                            }
                         }
                         Protocol.TYPE_CONTROL -> {
                             val (cmd, _) = Protocol.unpackControl(plain)
                             if (cmd == Protocol.CMD_BYE) {
                                 Log.d(TAG, "PC said bye")
-                                sessionKey = null
+                                sendCipher = null
+                            } else if (cmd == Protocol.CMD_REPORT) {
+                                Protocol.unpackReport(plain)?.let { pcReports.add(it) }
                             }
                         }
                     }
                 } catch (_: java.net.SocketTimeoutException) {
                     // Poll again
                 } catch (e: Exception) {
-                    if (sessionKey != null) Log.w(TAG, "Recv error: ${e.message}")
+                    if (sendCipher != null) Log.w(TAG, "Recv error: ${e.message}")
                 }
 
                 val now = System.currentTimeMillis()
+                if (now - lastReportAtMs >= Protocol.REPORT_INTERVAL_MS) {
+                    lastReportAtMs = now
+                    val (loss, burst) = meter.snapshot()
+                    val late = jb.late
+                    val concealed = jb.concealed
+                    val stalls = jb.stalls
+                    val cipher = sendCipher
+                    if (cipher != null) runCatching {
+                        sendPacket(cipher, Protocol.TYPE_CONTROL, Protocol.packReport(Protocol.LinkReport(
+                            lossPermille = (loss * 1000).roundToInt(), maxBurst = burst,
+                            stalls = stalls - reportedStalls, late = late - reportedLate,
+                            concealed = concealed - reportedConcealed, targetMs = jb.targetDepth * Codec.FRAME_MS,
+                        )))
+                    }
+                    reportedLate = late
+                    reportedConcealed = concealed
+                    reportedStalls = stalls
+                }
                 if (now - lastStatsLog >= 3000) {
                     lastStatsLog = now
                     Log.d(TAG, "Playback stats: ${playbackStats(jb)}")
@@ -437,18 +510,18 @@ class StreamService : Service() {
     // Control
     // ---------------------------------------------------------------------------
 
-    private fun sendPacket(key: ByteArray, type: Byte, plain: ByteArray) {
+    private fun sendPacket(cipher: CryptoEngine.PacketCipher, type: Byte, plain: ByteArray) {
         val counter = sendCounter.getAndIncrement()
-        val ct = CryptoEngine.encryptPacket(key, ourStreamId, counter, type, plain)
-        val pkt = Protocol.pack(Protocol.Packet(type, counter, ourStreamId, ct))
+        val ct = cipher.encrypt(ourStreamId, counter, type, plain)
+        val pkt = Protocol.pack(type, counter, ourStreamId, ct)
         audioSocket?.send(DatagramPacket(pkt, pkt.size, pcAddr, pcAudioPort))
     }
 
     fun sendControlCommand(cmd: Byte, value: Int) {
-        val key = sessionKey ?: return
+        val cipher = sendCipher ?: return
         scope.launch {
             try {
-                sendPacket(key, Protocol.TYPE_CONTROL, Protocol.packControl(cmd, value))
+                sendPacket(cipher, Protocol.TYPE_CONTROL, Protocol.packControl(cmd, value))
             } catch (e: Exception) {
                 Log.w(TAG, "Control send error: ${e.message}")
             }
@@ -457,10 +530,10 @@ class StreamService : Service() {
 
     /** Sends a few BYE copies synchronously (UDP; one may be lost). */
     private fun sendBye() {
-        val key = sessionKey ?: return
+        val cipher = sendCipher ?: return
         val t = Thread {
             repeat(3) {
-                runCatching { sendPacket(key, Protocol.TYPE_CONTROL, Protocol.packControl(Protocol.CMD_BYE)) }
+                runCatching { sendPacket(cipher, Protocol.TYPE_CONTROL, Protocol.packControl(Protocol.CMD_BYE)) }
             }
         }
         t.start()
@@ -474,9 +547,9 @@ class StreamService : Service() {
      * MainActivity is still bound to it.
      */
     fun disconnectSession() {
-        if (sessionKey == null) return
+        if (sendCipher == null) return
         sendBye()
-        sessionKey = null
+        sendCipher = null
         setMicActive(false)
     }
 
@@ -507,7 +580,7 @@ class StreamService : Service() {
         mode = newMode
         settingsPrefs.edit().putString(PREF_MODE, newMode.name).apply()
 
-        if (sessionKey != null) {
+        if (sendCipher != null) {
             val jb = jitterBuffer
             if (newMode == StreamMode.HEADSET && jb != null) {
                 audio.startPlayback(jb)

@@ -44,6 +44,19 @@ Java_com_lantooth_NativeOpus_encode(JNIEnv *env, jclass cls, jlong handle, jshor
     return n;
 }
 
+// Bitrate and expected packet loss follow the peer's link reports (LinkQuality.kt).
+JNIEXPORT jint JNICALL
+Java_com_lantooth_NativeOpus_encoderSetBitrate(JNIEnv *env, jclass cls, jlong handle, jint bitrate) {
+    if (handle == 0) return OPUS_INVALID_STATE;
+    return opus_encoder_ctl(ENC(handle), OPUS_SET_BITRATE(bitrate));
+}
+
+JNIEXPORT jint JNICALL
+Java_com_lantooth_NativeOpus_encoderSetLossPercent(JNIEnv *env, jclass cls, jlong handle, jint percent) {
+    if (handle == 0) return OPUS_INVALID_STATE;
+    return opus_encoder_ctl(ENC(handle), OPUS_SET_PACKET_LOSS_PERC(percent));
+}
+
 JNIEXPORT void JNICALL
 Java_com_lantooth_NativeOpus_encoderDestroy(JNIEnv *env, jclass cls, jlong handle) {
     if (handle != 0) opus_encoder_destroy(ENC(handle));

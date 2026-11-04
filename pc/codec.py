@@ -158,6 +158,16 @@ class Encoder:
         self._samples = FRAME_SAMPLES * channels
         self._out = ctypes.create_string_buffer(_MAX_PACKET)
 
+    def _ctl(self, request: int, value: int) -> None:
+        self._lib.opus_encoder_ctl(ctypes.c_void_p(self._ptr), ctypes.c_int(request), ctypes.c_int(value))
+
+    def set_bitrate(self, bitrate: int) -> None:
+        self._ctl(_SET_BITRATE, bitrate)
+
+    def set_loss_hint(self, percent: int) -> None:
+        """Expected packet loss (OPUS_SET_PACKET_LOSS_PERC), from the peer's reports."""
+        self._ctl(_SET_PACKET_LOSS_PERC, percent)
+
     def encode(self, pcm: bytes) -> bytes:
         """Encode one frame of interleaved int16 PCM → Opus packet."""
         src = (ctypes.c_short * self._samples).from_buffer_copy(pcm)

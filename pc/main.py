@@ -12,6 +12,7 @@ Usage:
   python main.py --no-agc                 # play the phone mic without auto-levelling
   python main.py --exclusive              # exclusive-mode WASAPI playback (lowest latency)
   python main.py --latency-test           # measure the round trip once connected
+  python main.py --dscp 46                # Wi-Fi priority mark (48 or 46; default from the GUI setting)
   python main.py --version                # protocol + libopus version (checks the DLL loads)
 """
 
@@ -28,7 +29,7 @@ from audio_engine import list_capture_options, list_playback_options, list_devic
 from config import load_config, remember_ip
 from identity import load_or_create_identity
 from pairing import ConnectClient
-from protocol import PAIRING_PORT, PROTOCOL_VERSION
+from protocol import DSCP_VALUES, PAIRING_PORT, PROTOCOL_VERSION
 from version import __version__
 from session import END_BYE, END_ERROR, connect_once, stream_session, SessionStats
 
@@ -180,9 +181,10 @@ def _print_status(text: str) -> None:
 
 
 def _print_stats(stats: SessionStats) -> None:
-    print(f"  [stats] sent_to_phone={stats.sent}  "
-          f"from_phone_mic: received={stats.received} recovered={stats.recovered} "
-          f"concealed={stats.concealed} underruns={stats.underruns} late={stats.late} "
+    print(f"  [stats] to_phone: sent={stats.sent} loss={stats.phone_loss:.1%} "
+          f"bitrate={stats.bitrate // 1000}k redundancy={stats.redundancy}  "
+          f"from_phone_mic: received={stats.received} loss={stats.mic_loss:.1%} recovered={stats.recovered} "
+          f"concealed={stats.concealed} underruns={stats.underruns} stalls={stats.stalls} late={stats.late} "
           f"trimmed={stats.trimmed} buffer={stats.target_depth * codec.FRAME_MS}ms "
           f"decode_errors={stats.decode_errors}")
 
@@ -211,6 +213,8 @@ def main() -> None:
                         help="Exclusive-mode WASAPI playback of the phone mic (lowest latency)")
     parser.add_argument("--latency-test", action="store_true",
                         help="Measure the round trip once connected (phone on loudspeaker, hold Talk)")
+    parser.add_argument("--dscp", type=int, choices=DSCP_VALUES, default=None,
+                        help="Wi-Fi priority mark of the audio packets (see the GUI's Wi-Fi priority setting)")
     parser.add_argument("--version", action="store_true",
                         help="Print protocol and libopus versions and exit")
     args = parser.parse_args()
@@ -263,6 +267,7 @@ def main() -> None:
         # 1. Find Android, 2. audio source and destination — asked once; a
         # dropped link reconnects to the same phone/devices without re-asking.
         cfg = load_config()
+        dscp = args.dscp if args.dscp is not None else cfg["dscp"]
         android_ip, android_port = _select_android(args, cfg), PAIRING_PORT
         print(f"  Target: {android_ip}:{android_port}")
         print()
@@ -276,7 +281,7 @@ def main() -> None:
             try:
                 session, our_stream_id, audio_sock = connect_once(
                     client, android_ip, android_port, identity_priv, display_name,
-                    media_channels=media_channels,
+                    media_channels=media_channels, dscp=dscp,
                 )
             except Exception as e:
                 print(f"  Connection failed: {e}")

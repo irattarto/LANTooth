@@ -1,22 +1,23 @@
 """
 Connect handshake for LANTooth PC (client role) — Bluetooth-style numeric
-comparison on first pairing, automatic afterwards (protocol v4).
+comparison on first pairing, automatic afterwards (protocol v6).
 
 Both devices have a persistent X25519 identity key. PC is the initiator:
 
   CONNECT_REQ:     identity_pub(32) + commitment(32) + pc_audio_port(2) +
                    pc_stream_id(4) + protocol_version(1) + name_len(1) + name +
-                   media_channels(1)    commitment = SHA256(tag || pc_ephemeral_pub)
+                   media_channels(1) + dscp(1)    commitment = SHA256(tag || pc_ephemeral_pub)
   CONNECT_PENDING: phone_identity_pub(32) + phone_ephemeral_pub(32)
                    (phone is waiting for its user to accept an unknown PC)
   CONNECT_REVEAL:  pc_ephemeral_pub(32)  (sent after PENDING; opens the commitment)
   CONNECT_ACCEPT:  phone_ephemeral_pub(32) + phone_audio_port(2) +
                    phone_stream_id(4) + phone_identity_pub(32)
   CONNECT_REJECT:  reason(1B) + phone_protocol_version(1B)
+                   [+ phone_ephemeral_pub(32) + HMAC(confirm_key, transcript)  for a user reject]
   CONNECT_CONFIRM: pc_ephemeral_pub(32) + HMAC(confirm_key, transcript)  (several copies)
   CONNECT_READY:   phone_ephemeral_pub(32) + HMAC(confirm_key, transcript)  (phone's proof)
   CONNECT_UNKNOWN: pc_ephemeral_pub(32) + HMAC(confirm_key, transcript)  (phone must re-pair)
-  CONNECT_CANCEL:  commitment(32)  (user declined the code)
+  CONNECT_CANCEL:  pc_ephemeral_pub(32) + HMAC(confirm_key, transcript)  (user declined the code)
 
 The PC commits to its ephemeral key before it sees the phone's and reveals it
 only afterwards. Without that, a man-in-the-middle could pick its keys after
@@ -32,6 +33,9 @@ Session keys come from four DH results (see crypto.derive_session_keys), so only
 the real phone and the real PC can derive them. Each side starts the session only
 after a valid proof from the other (CONFIRM to the phone, READY to the PC), so
 neither a replayed CONNECT_REQ nor a spoofed CONNECT_ACCEPT can occupy a peer.
+Cancel and user-reject are authenticated the same way, so nobody else on the LAN
+can abort a pairing; a version-mismatch reject (which can't be) only ends the
+attempt if the phone gives no other answer within MISMATCH_GRACE_S.
 The handshake itself carries nothing secret, so it travels as plaintext UDP.
 """
 
@@ -49,18 +53,20 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
 )
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from crypto import derive_session_keys, confirm_mac, ready_mac, unknown_mac, commitment, pairing_code, format_code
+from crypto import (derive_session_keys, confirm_mac, ready_mac, unknown_mac, cancel_mac, reject_mac,
+                    commitment, pairing_code, format_code, SessionKeys)
 from phones import PhoneTrustStore
 from protocol import (
     CONNECT_REQ, CONNECT_PENDING, CONNECT_REVEAL, CONNECT_ACCEPT, CONNECT_REJECT,
     CONNECT_CONFIRM, CONNECT_READY, CONNECT_UNKNOWN, CONNECT_CANCEL,
-    PROTOCOL_VERSION, REJECT_REASON_VERSION_MISMATCH,
+    PROTOCOL_VERSION, REJECT_REASON_USER, REJECT_REASON_VERSION_MISMATCH, DEFAULT_DSCP,
 )
 
 RESEND_INTERVAL_S = 2.0
 CONFIRM_COPIES = 5          # UDP: a few copies so one lost datagram can't stall the session
 CONFIRM_SPACING_S = 0.05
 MAX_PENDING_SESSIONS = 8    # offers answered with CONFIRM that still await the phone's READY
+MISMATCH_GRACE_S = 5.0      # an unauthenticated version-mismatch reject counts only if nothing else answers
 _POLL_S = 0.25  # how quickly a stop request is noticed
 
 
@@ -80,6 +86,20 @@ def _raw(pub) -> bytes:
     return pub.public_bytes(Encoding.Raw, PublicFormat.Raw)
 
 
+def _derive(identity_priv, eph_priv, pc_id: bytes, pc_eph: bytes, ph_id: bytes, ph_eph: bytes) -> SessionKeys | None:
+    """Session keys with the phone keys (ph_id, ph_eph), or None for an invalid / low-order key."""
+    try:
+        ph_eph_key = X25519PublicKey.from_public_bytes(ph_eph)
+        ph_id_key = X25519PublicKey.from_public_bytes(ph_id)
+        return derive_session_keys(
+            eph_priv.exchange(ph_eph_key), identity_priv.exchange(ph_eph_key),
+            eph_priv.exchange(ph_id_key), identity_priv.exchange(ph_id_key),
+            pc_id, pc_eph, ph_id, ph_eph,
+        )
+    except ValueError:
+        return None
+
+
 class ConnectClient:
     """Handles the client-side connect handshake (PC → Android).
 
@@ -97,7 +117,7 @@ class ConnectClient:
         """Un-pin every phone: each must be paired again with the code on both devices."""
         self._trust.forget_all()
 
-    def _ensure_pinned(self, sock, addr, pc_id, pc_eph, ph_id, ph_eph, force: bool = False) -> None:
+    def _ensure_pinned(self, sock, addr, keys, pc_id, pc_eph, ph_id, ph_eph, force: bool = False) -> None:
         # `force`: the phone answered PENDING, i.e. it does not know this PC and is
         # showing a code — compare it even if we still have the phone pinned (it was
         # re-paired or "forgot" us), otherwise the phone shows a code we never ask about.
@@ -106,7 +126,7 @@ class ConnectClient:
         code = pairing_code(pc_id, pc_eph, ph_id, ph_eph)
         if self._confirm is None or not self._confirm(format_code(code)):
             try:
-                sock.sendto(CONNECT_CANCEL + commitment(pc_eph), addr)
+                sock.sendto(CONNECT_CANCEL + pc_eph + cancel_mac(keys, pc_id, pc_eph, ph_id, ph_eph), addr)
             except OSError:
                 pass
             raise RuntimeError("Pairing declined — the codes did not match")
@@ -123,6 +143,7 @@ class ConnectClient:
         media_channels: int = 2,
         timeout: float = 60.0,
         stop_event: threading.Event | None = None,
+        dscp: int = DEFAULT_DSCP,
     ) -> SessionResult:
         """
         Send CONNECT_REQ, resending every ~2s, until Android accepts, rejects,
@@ -145,19 +166,31 @@ class ConnectClient:
                 + commitment(pc_eph)
                 + struct.pack("!HIBB", our_audio_port, our_stream_id, PROTOCOL_VERSION, len(name_bytes))
                 + name_bytes
-                + struct.pack("!B", media_channels)
+                + struct.pack("!BB", media_channels, dscp)
             )
 
             # ph_eph -> (keys, ph_id, android port, android stream id) for every offer we
             # answered with CONFIRM; a READY proof from the real phone completes one.
             offers: dict[bytes, tuple] = {}
             confirmed: set[bytes] = set()   # (phone id || phone eph) pairs whose code the user already approved
+            # phone eph -> (keys, phone id) from PENDING: what an authenticated user reject is checked against
+            prompted: dict[bytes, tuple[SessionKeys, bytes]] = {}
+            mismatch: tuple[int, float] | None = None   # (phone's version, when it said so)
+
+            def mismatch_error(their_version: int) -> RuntimeError:
+                return RuntimeError(
+                    f"Version mismatch: this PC speaks protocol v{PROTOCOL_VERSION}, "
+                    f"phone speaks v{their_version} — rebuild/reinstall both PC and "
+                    f"Android from the same version and try again."
+                )
 
             deadline = time.monotonic() + timeout
             next_send = 0.0
             while (now := time.monotonic()) < deadline:
                 if stop_event is not None and stop_event.is_set():
                     raise ConnectCancelled()
+                if mismatch is not None and now - mismatch[1] >= MISMATCH_GRACE_S:
+                    raise mismatch_error(mismatch[0])
                 if now >= next_send:
                     sock.sendto(req, addr)
                     next_send = now + RESEND_INTERVAL_S
@@ -175,22 +208,35 @@ class ConnectClient:
                 if data.startswith(CONNECT_REJECT):
                     body = data[len(CONNECT_REJECT):]
                     if len(body) >= 2 and body[0] == REJECT_REASON_VERSION_MISMATCH:
-                        their_version = body[1]
-                        raise RuntimeError(
-                            f"Version mismatch: this PC speaks protocol v{PROTOCOL_VERSION}, "
-                            f"phone speaks v{their_version} — rebuild/reinstall both PC and "
-                            f"Android from the same version and try again."
-                        )
-                    raise RuntimeError("Connection rejected on Android")
+                        # Unauthenticated: believed only if the phone says nothing else.
+                        if mismatch is None:
+                            mismatch = (body[1], now)
+                        continue
+                    if len(body) >= 66 and body[0] == REJECT_REASON_USER:
+                        entry = prompted.get(body[2:34])
+                        if entry is not None and hmac.compare_digest(
+                                body[34:66], reject_mac(entry[0], pc_id, pc_eph, entry[1], body[2:34])):
+                            raise RuntimeError("Connection rejected on Android")
+                    continue  # unauthenticated: anyone on the LAN could have sent it
+
+                if data.startswith((CONNECT_PENDING, CONNECT_ACCEPT, CONNECT_READY)):
+                    mismatch = None   # the phone speaks our version after all
 
                 if data.startswith(CONNECT_PENDING):
                     body = data[len(CONNECT_PENDING):]
                     if len(body) < 64:
                         continue
+                    ph_id, ph_eph_raw = body[:32], body[32:64]
+                    keys = _derive(identity_priv, eph_priv, pc_id, pc_eph, ph_id, ph_eph_raw)
+                    if keys is None:
+                        continue  # bad / low-order key from a spoofed packet
                     # Open the commitment now that the phone's keys are known.
                     sock.sendto(CONNECT_REVEAL + pc_eph, addr)
                     if body[:64] not in confirmed:     # the phone resends PENDING with every REQ
-                        self._ensure_pinned(sock, addr, pc_id, pc_eph, body[:32], body[32:64], force=True)
+                        if len(prompted) >= MAX_PENDING_SESSIONS:
+                            prompted.pop(next(iter(prompted)))
+                        prompted[ph_eph_raw] = (keys, ph_id)
+                        self._ensure_pinned(sock, addr, keys, pc_id, pc_eph, ph_id, ph_eph_raw, force=True)
                         confirmed.add(body[:64])
                     # The user may have taken a while over the code dialog.
                     deadline = max(deadline, time.monotonic() + timeout)
@@ -203,15 +249,8 @@ class ConnectClient:
                     ph_eph_raw = body[:32]
                     android_audio_port, android_stream_id = struct.unpack_from("!HI", body, 32)
                     ph_id = body[38:70]
-                    try:
-                        ph_eph = X25519PublicKey.from_public_bytes(ph_eph_raw)
-                        ph_id_key = X25519PublicKey.from_public_bytes(ph_id)
-                        keys = derive_session_keys(
-                            eph_priv.exchange(ph_eph), identity_priv.exchange(ph_eph),
-                            eph_priv.exchange(ph_id_key), identity_priv.exchange(ph_id_key),
-                            pc_id, pc_eph, ph_id, ph_eph_raw,
-                        )
-                    except ValueError:
+                    keys = _derive(identity_priv, eph_priv, pc_id, pc_eph, ph_id, ph_eph_raw)
+                    if keys is None:
                         continue  # bad / low-order key from a spoofed packet
                     if not self._trust.is_pinned(ph_id):
                         # The phone is auto-accepting us but we don't know it (we forgot it, or
@@ -247,6 +286,8 @@ class ConnectClient:
                     return SessionResult(keys.pc_to_phone, keys.phone_to_pc,
                                          android_audio_port, android_stream_id)
 
+            if mismatch is not None:
+                raise mismatch_error(mismatch[0])
             raise RuntimeError("Timed out waiting for you to accept the connection on Android")
         finally:
             sock.close()

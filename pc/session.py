@@ -4,12 +4,14 @@ so protocol/session-loop changes only have to be made in one place.
 
 Covers: the connect-handshake + ephemeral audio socket setup, UDPStream + JitterBuffer
 wiring, the capture -> Opus encode -> send loop, control-command handling (media
-keys, keepalive, bye), liveness-timeout detection, and periodic stats reporting.
+keys, keepalive, bye), link reports in both directions and the send adaptation
+they drive (link_quality.py), liveness-timeout detection, and periodic stats.
 Callers (main.py/gui.py) supply on_status/on_stats callbacks so each can present that
 information however it likes (print vs. a Tk status label) without duplicating the
 loop itself.
 """
 
+import collections
 import logging
 import os
 import socket
@@ -24,12 +26,13 @@ import codec
 from audio_engine import AudioCapture, WasapiLoopbackCapture, AudioPlayback
 from jitter_buffer import JitterBuffer
 from latency_probe import LatencyProbe
+from link_quality import MONO_BITRATES, STEREO_BITRATES, SendAdapter
 from media_control import handle_control
 from mic_agc import MicAgc
 from pairing import ConnectClient, SessionResult
 from protocol import (
-    pack_control, unpack_control, pack_audio, unpack_audio, CMD_KEEPALIVE, CMD_BYE,
-    CMD_PLAY_PAUSE,
+    pack_control, unpack_control, pack_audio, unpack_audio, pack_report, unpack_report, LinkReport,
+    CMD_KEEPALIVE, CMD_BYE, CMD_PLAY_PAUSE, CMD_REPORT, DEFAULT_DSCP, MAX_REDUNDANCY, REPORT_INTERVAL_S,
 )
 from stream import UDPStream
 
@@ -56,12 +59,15 @@ _link_paused_at: float | None = None
 ACTIVE_PEAK = 100          # int16 units, about -50 dBFS
 ACTIVE_WINDOW_S = 5.0
 
-MEDIA_BITRATE = {1: 128_000, 2: 256_000}   # PC -> phone, by channel count
+MEDIA_BITRATES = {1: MONO_BITRATES, 2: STEREO_BITRATES}   # PC -> phone, by channel count
 
-# DSCP EF (46) << 2: asks Wi-Fi (WMM) to use the voice access category. Windows
-# only honours it when a QoS policy allows the app to set DSCP (gpedit: Policy-
-# based QoS); otherwise it is silently ignored, which is harmless.
-_TOS_EF = 0xB8
+# A gap this long between captured frames means capture stopped delivering (WASAPI
+# loopback goes quiet while nothing plays): advance seq by the time that passed,
+# so the phone sees a pause instead of a burst of network delay. Shorter gaps are
+# ordinary callback jitter. The capture queue holds at most 80ms, so no capture
+# path legitimately delivers in chunks this large.
+SEQ_GAP_S = 0.1
+_FRAME_S = codec.FRAME_MS / 1000.0
 
 # Why stream_session() returned
 END_STOPPED = "stopped"   # should_stop() became true (user disconnected on the PC)
@@ -73,6 +79,9 @@ END_ERROR = "error"       # audio device could not be opened
 @dataclass
 class SessionStats:
     sent: int            # PC -> phone frames
+    phone_loss: float    #   loss the phone reports for them
+    bitrate: int         #   current PC -> phone bitrate
+    redundancy: int      #   earlier frames carried per packet
     received: int        # phone -> PC frames, and how they were played:
     recovered: int       #   restored from the redundant copy
     concealed: int       #   lost, concealed
@@ -81,6 +90,8 @@ class SessionStats:
     trimmed: int
     target_depth: int    # jitter buffer target, frames (x codec.FRAME_MS)
     decode_errors: int
+    mic_loss: float      # phone -> PC packet loss we measure
+    stalls: int          # phone -> PC underruns caused by the network
 
 
 def connect_once(
@@ -92,17 +103,22 @@ def connect_once(
     media_channels: int = 2,
     timeout: float = 60.0,
     stop_event: threading.Event | None = None,
+    dscp: int = DEFAULT_DSCP,
 ) -> tuple[SessionResult, int, socket.socket]:
     """Bind a fresh ephemeral audio socket and run the connect handshake.
 
     The audio socket is bound before the handshake so the port advertised to Android
     matches what UDPStream will actually listen on. Returns (session, our_stream_id,
     audio_sock) on success; closes audio_sock and re-raises on failure.
+
+    dscp is the Wi-Fi priority for the audio packets, also sent to the phone. On
+    Windows the mark set here is ignored unless a QoS policy marks the app's
+    traffic (qos.py), whose value then applies; harmless otherwise.
     """
     our_stream_id = int.from_bytes(os.urandom(4), "big")
     audio_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        audio_sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, _TOS_EF)
+        audio_sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, dscp << 2)
     except OSError:
         pass
     audio_sock.bind(("", 0))
@@ -111,6 +127,7 @@ def connect_once(
         session = client.connect(
             android_ip, pairing_port, identity_priv, our_audio_port, our_stream_id,
             display_name, media_channels=media_channels, timeout=timeout, stop_event=stop_event,
+            dscp=dscp,
         )
     except BaseException:
         audio_sock.close()
@@ -146,9 +163,11 @@ def stream_session(
     """
     last_recv = time.monotonic()
     bye_received = False
+    adapter = SendAdapter(MEDIA_BITRATES[media_channels])
+    reports: "collections.deque[LinkReport]" = collections.deque(maxlen=8)  # recv thread -> session loop
 
     try:
-        encoder = codec.Encoder(channels=media_channels, bitrate=MEDIA_BITRATE[media_channels])
+        encoder = codec.Encoder(channels=media_channels, bitrate=adapter.bitrate)
         jitter = JitterBuffer(codec.Decoder(channels=codec.MIC_CHANNELS))
     except Exception as e:
         on_status(f"Opus error: {e}")
@@ -161,7 +180,8 @@ def stream_session(
         if parsed is None:
             return
         last_recv = time.monotonic()
-        jitter.push(*parsed)
+        seq, frames = parsed
+        jitter.push(seq, frames[0], frames[1:])
 
     def on_control(ctrl_bytes: bytes) -> None:
         nonlocal last_recv, bye_received
@@ -169,6 +189,11 @@ def stream_session(
         cmd, val = unpack_control(ctrl_bytes)
         if cmd == CMD_BYE:
             bye_received = True
+        elif cmd == CMD_REPORT:
+            # Applied on the session loop: the encoder isn't safe to reconfigure mid-encode.
+            report = unpack_report(ctrl_bytes)
+            if report is not None:
+                reports.append(report)
         elif cmd != CMD_KEEPALIVE:
             handle_control(cmd, val)
 
@@ -218,37 +243,70 @@ def stream_session(
 
     sent_count = 0
     seq = 0
-    prev_opus: bytes | None = None
+    history: "collections.deque[bytes]" = collections.deque(maxlen=MAX_REDUNDANCY)  # frames seq-1, seq-2, ...
+    last_frame_at: float | None = None
     last_stats = time.monotonic()
     last_keepalive = time.monotonic()
+    last_report = time.monotonic()
+    reported = (0, 0, 0)          # jitter late / concealed / stalls at the previous report
+    mic_loss = 0.0
     last_active = float("-inf")   # last time the captured PC audio was non-silent
     reason = END_STOPPED
 
     def stats() -> SessionStats:
         return SessionStats(
-            sent=sent_count, received=jitter.received, recovered=jitter.recovered,
+            sent=sent_count, phone_loss=adapter.peer_loss, bitrate=adapter.bitrate,
+            redundancy=adapter.redundancy, received=jitter.received, recovered=jitter.recovered,
             concealed=jitter.concealed, underruns=jitter.underruns, late=jitter.late,
             trimmed=jitter.trimmed, target_depth=jitter.target_depth,
-            decode_errors=jitter.decode_errors,
+            decode_errors=jitter.decode_errors, mic_loss=mic_loss, stalls=jitter.stalls,
         )
 
     try:
         while not should_stop():
             pcm = capture.read(timeout=0.02)
             if pcm:
+                got_at = time.monotonic()
                 if np.abs(np.frombuffer(pcm, dtype=np.int16)).max(initial=0) > ACTIVE_PEAK:
-                    last_active = time.monotonic()
+                    last_active = got_at
+                if last_frame_at is not None and got_at - last_frame_at > SEQ_GAP_S:
+                    # Capture paused: those frame slots passed with nothing sent.
+                    seq += round((got_at - last_frame_at) / _FRAME_S) - 1
+                    history.clear()   # the frames before this one were never sent
+                last_frame_at = got_at
                 pcm = probe.outgoing(pcm)
                 try:
                     opus = encoder.encode(pcm)
-                    stream.send_audio(pack_audio(seq, opus, prev_opus))
-                    prev_opus = opus
-                    seq += 1
+                    stream.send_audio(pack_audio(seq, [opus, *list(history)[:adapter.redundancy]]))
+                    history.appendleft(opus)
                     sent_count += 1
                 except Exception as e:
+                    history.clear()
                     on_status(f"Encode error: {e}")
+                seq += 1
+
+            while reports:
+                bitrate, hint = adapter.bitrate, adapter.loss_hint
+                adapter.on_report(reports.popleft())
+                if adapter.bitrate != bitrate:
+                    encoder.set_bitrate(adapter.bitrate)
+                    _log.info("PC -> phone bitrate %d kbps (phone reports %.1f%% loss)",
+                              adapter.bitrate // 1000, adapter.peer_loss * 100)
+                if adapter.loss_hint != hint:
+                    encoder.set_loss_hint(adapter.loss_hint)
 
             now = time.monotonic()
+
+            if now - last_report >= REPORT_INTERVAL_S:
+                last_report = now
+                mic_loss, burst = stream.meter.snapshot()
+                late, concealed, stalls = jitter.late, jitter.concealed, jitter.stalls
+                stream.send_control(pack_report(LinkReport(
+                    loss_permille=round(mic_loss * 1000), max_burst=burst,
+                    stalls=stalls - reported[2], late=late - reported[0],
+                    concealed=concealed - reported[1], target_ms=jitter.target_depth * codec.FRAME_MS,
+                )))
+                reported = (late, concealed, stalls)
 
             if latency_test is not None and latency_test.is_set() and not probe.active:
                 latency_test.clear()

@@ -21,6 +21,10 @@ object Protocol {
     // peer drop the session at once instead of waiting out LIVENESS_TIMEOUT, and
     // tells the PC not to auto-reconnect straight back into a phone that just hung up.
     const val CMD_BYE: Byte           = 0x0B
+    // Link-quality report for the stream the sender RECEIVES (see packReport), sent
+    // every REPORT_INTERVAL_MS so the other side can adapt its redundancy/bitrate.
+    const val CMD_REPORT: Byte        = 0x0C
+    const val REPORT_INTERVAL_MS = 500L
 
     const val PAIRING_PORT = 7890  // fixed UDP port the PC connects to (phone IP + this port)
     const val MAX_UDP_PAYLOAD = 1400
@@ -41,7 +45,10 @@ object Protocol {
     //       man-in-the-middle cannot grind keys to force matching codes), and a
     //       CONNECT_READY key-confirmation proof from the phone
     //   v5: 10ms Opus frames (was 20ms) in both directions
-    const val PROTOCOL_VERSION: Int = 5
+    //   v6: audio seq advances with real time (also while muted); payload carries
+    //       up to MAX_REDUNDANCY earlier frames; CMD_REPORT link reports;
+    //       authenticated CONNECT_CANCEL and user CONNECT_REJECT; DSCP in CONNECT_REQ
+    const val PROTOCOL_VERSION: Int = 6
 
     // Connect handshake (Bluetooth-style numeric comparison on first pairing, then automatic)
     val CONNECT_REQ     = "CONNECT_REQ".toByteArray(Charsets.US_ASCII)      // PC -> phone: identity key + commitment to the ephemeral key
@@ -52,9 +59,11 @@ object Protocol {
     val CONNECT_CONFIRM = "CONNECT_CONFIRM".toByteArray(Charsets.US_ASCII)  // PC -> phone: ephemeral key + proof of the session key
     val CONNECT_READY   = "CONNECT_READY".toByteArray(Charsets.US_ASCII)    // phone -> PC: proof the phone derived the same keys
     val CONNECT_UNKNOWN = "CONNECT_UNKNOWN".toByteArray(Charsets.US_ASCII)  // PC -> phone: authenticated "I no longer know you", re-pair with a code
-    val CONNECT_CANCEL  = "CONNECT_CANCEL".toByteArray(Charsets.US_ASCII)   // PC -> phone: user declined the code
+    val CONNECT_CANCEL  = "CONNECT_CANCEL".toByteArray(Charsets.US_ASCII)   // PC -> phone: user declined the code (authenticated)
 
-    // CONNECT_REJECT body reason codes: 1B reason + 1B responder's PROTOCOL_VERSION
+    // CONNECT_REJECT body: 1B reason + 1B responder's PROTOCOL_VERSION, and for
+    // REJECT_REASON_USER also our ephemeral key(32) + HMAC(confirm key, transcript),
+    // so nobody else on the LAN can abort the PC's connect by faking one.
     const val REJECT_REASON_USER: Byte             = 0  // user tapped Reject on Android
     const val REJECT_REASON_VERSION_MISMATCH: Byte = 1  // auto-rejected before any user prompt
 
@@ -70,12 +79,21 @@ object Protocol {
     val READY_TAG        = "lantooth-ready-v4".toByteArray(Charsets.US_ASCII)
     val COMMIT_TAG       = "lantooth-commit-v4".toByteArray(Charsets.US_ASCII)
     val UNKNOWN_TAG      = "lantooth-unknown-v4".toByteArray(Charsets.US_ASCII)
+    val CANCEL_TAG       = "lantooth-cancel-v6".toByteArray(Charsets.US_ASCII)
+    val REJECT_TAG       = "lantooth-reject-v6".toByteArray(Charsets.US_ASCII)
+
+    // Wi-Fi priority (DSCP) the PC asks for in CONNECT_REQ (see pc/protocol.py DSCP_VALUES).
+    const val DEFAULT_DSCP = 48
 
     // Audio payload (inside the encrypted packet):
-    //   [ 4B seq | 2B cur_len | cur Opus frame | previous Opus frame (optional) ]
-    // The previous frame is a redundant copy so any single lost packet is
-    // recovered exactly by the next one. Left out when both wouldn't fit.
-    private const val AUDIO_HDR_SIZE = 6
+    //   [ 4B seq | 1B count | count x 2B frame length | frames ]
+    // frames[0] is frame seq, frames[i] is frame seq - i: redundant copies of the
+    // frames before it, so a burst of up to count - 1 lost packets is recovered
+    // exactly by the next packet that arrives. Copies that wouldn't fit are left out.
+    // seq counts 10ms frame slots of real time, so it also advances while muted
+    // (no packets sent) — the receiver tells a pause from network delay by it.
+    private const val AUDIO_HDR_SIZE = 5
+    const val MAX_REDUNDANCY = 3
     private const val MAX_AUDIO_PAYLOAD = MAX_UDP_PAYLOAD - 16 - 50  // AEAD tag + headroom
 
     fun startsWithTag(data: ByteArray, tag: ByteArray): Boolean {
@@ -84,25 +102,28 @@ object Protocol {
         return true
     }
 
-    class Packet(
+    /** Header fields of a received packet; its ciphertext is data[payloadOffset, payloadOffset + payloadLength). */
+    class Header(
         val type: Byte,
         val counter: Long,
         val streamId: Int,
-        val payload: ByteArray,
+        val payloadOffset: Int,
+        val payloadLength: Int,
     )
 
-    fun pack(pkt: Packet): ByteArray {
-        val buf = ByteBuffer.allocate(HEADER_SIZE + pkt.payload.size).order(ByteOrder.BIG_ENDIAN)
-        buf.put(pkt.type)
-        buf.putLong(pkt.counter)
-        buf.putInt(pkt.streamId)
-        buf.putShort(pkt.payload.size.toShort())
-        buf.put(pkt.payload)
+    /** Writes header + [payload] for sending. */
+    fun pack(type: Byte, counter: Long, streamId: Int, payload: ByteArray): ByteArray {
+        val buf = ByteBuffer.allocate(HEADER_SIZE + payload.size).order(ByteOrder.BIG_ENDIAN)
+        buf.put(type)
+        buf.putLong(counter)
+        buf.putInt(streamId)
+        buf.putShort(payload.size.toShort())
+        buf.put(payload)
         return buf.array()
     }
 
-    /** Parses a received datagram occupying data[0 until length]. */
-    fun unpack(data: ByteArray, length: Int = data.size): Packet? {
+    /** Parses the header of a received datagram occupying data[0 until length], without copying the payload. */
+    fun unpackHeader(data: ByteArray, length: Int = data.size): Header? {
         if (length < HEADER_SIZE) return null
         val buf = ByteBuffer.wrap(data, 0, length).order(ByteOrder.BIG_ENDIAN)
         val type = buf.get()
@@ -110,19 +131,25 @@ object Protocol {
         val streamId = buf.int
         val plen = buf.short.toInt() and 0xFFFF
         if (plen > MAX_UDP_PAYLOAD || length < HEADER_SIZE + plen) return null
-        val payload = ByteArray(plen)
-        buf.get(payload)
-        return Packet(type, counter, streamId, payload)
+        return Header(type, counter, streamId, HEADER_SIZE, plen)
     }
 
-    class AudioFrame(val seq: Long, val cur: ByteArray, val prev: ByteArray?)
+    /** frames[0] = frame [seq], frames[i] = frame seq - i. */
+    class AudioFrame(val seq: Long, val frames: List<ByteArray>)
 
-    fun packAudio(seq: Int, cur: ByteArray, prev: ByteArray?): ByteArray {
-        val withPrev = prev != null && AUDIO_HDR_SIZE + cur.size + prev.size <= MAX_AUDIO_PAYLOAD
-        val buf = ByteBuffer.allocate(AUDIO_HDR_SIZE + cur.size + (if (withPrev) prev!!.size else 0))
-            .order(ByteOrder.BIG_ENDIAN)
-        buf.putInt(seq).putShort(cur.size.toShort()).put(cur)
-        if (withPrev) buf.put(prev!!)
+    /** [frames] newest first: frames[0] is frame [seq], frames[i] frame seq - i. */
+    fun packAudio(seq: Int, frames: List<ByteArray>): ByteArray {
+        var size = AUDIO_HDR_SIZE
+        var n = 0
+        for (f in frames) {
+            if (n == 1 + MAX_REDUNDANCY || (n > 0 && size + 2 + f.size > MAX_AUDIO_PAYLOAD)) break
+            size += 2 + f.size
+            n++
+        }
+        val buf = ByteBuffer.allocate(size).order(ByteOrder.BIG_ENDIAN)
+        buf.putInt(seq).put(n.toByte())
+        for (i in 0 until n) buf.putShort(frames[i].size.toShort())
+        for (i in 0 until n) buf.put(frames[i])
         return buf.array()
     }
 
@@ -130,12 +157,18 @@ object Protocol {
         if (data.size < AUDIO_HDR_SIZE) return null
         val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
         val seq = buf.int.toLong() and 0xFFFFFFFFL
-        val curLen = buf.short.toInt() and 0xFFFF
-        val end = AUDIO_HDR_SIZE + curLen
-        if (curLen == 0 || end > data.size) return null
-        val cur = data.copyOfRange(AUDIO_HDR_SIZE, end)
-        val prev = if (end < data.size) data.copyOfRange(end, data.size) else null
-        return AudioFrame(seq, cur, prev)
+        val count = buf.get().toInt() and 0xFF
+        if (count == 0 || count > 1 + MAX_REDUNDANCY) return null
+        var pos = AUDIO_HDR_SIZE + 2 * count
+        if (pos > data.size) return null
+        val frames = ArrayList<ByteArray>(count)
+        repeat(count) {
+            val len = buf.short.toInt() and 0xFFFF
+            if (len == 0 || pos + len > data.size) return null
+            frames.add(data.copyOfRange(pos, pos + len))
+            pos += len
+        }
+        return AudioFrame(seq, frames)
     }
 
     fun packControl(command: Byte, value: Int = 0): ByteArray {
@@ -149,5 +182,41 @@ object Protocol {
         val cmd = buf.get()
         val value = buf.short.toInt() and 0xFFFF
         return Pair(cmd, value)
+    }
+
+    /** Receiver's view of one stream over the last REPORT_INTERVAL_MS (mirrors pc/protocol.py LinkReport). */
+    data class LinkReport(
+        val lossPermille: Int,   // packets lost (transport-counter gaps)
+        val maxBurst: Int,       // longest run of consecutive lost packets
+        val stalls: Int,         // buffer ran dry because packets were late (not a sender pause)
+        val late: Int,           // frames that arrived after their play slot
+        val concealed: Int,      // frames lost for good
+        val targetMs: Int,       // receiver's jitter buffer target
+    )
+
+    private const val REPORT_SIZE = 3 + 2 + 1 + 1 + 2 + 2 + 2
+
+    fun packReport(r: LinkReport): ByteArray {
+        fun u8(v: Int) = v.coerceIn(0, 255).toByte()
+        fun u16(v: Int) = v.coerceIn(0, 0xFFFF).toShort()
+        return ByteBuffer.allocate(REPORT_SIZE).order(ByteOrder.BIG_ENDIAN)
+            .put(CMD_REPORT).putShort(0)
+            .putShort(u16(r.lossPermille)).put(u8(r.maxBurst)).put(u8(r.stalls))
+            .putShort(u16(r.late)).putShort(u16(r.concealed)).putShort(u16(r.targetMs))
+            .array()
+    }
+
+    /** Parses a CMD_REPORT control payload (including its 3-byte command header). */
+    fun unpackReport(data: ByteArray): LinkReport? {
+        if (data.size < REPORT_SIZE) return null
+        val buf = ByteBuffer.wrap(data, 3, REPORT_SIZE - 3).order(ByteOrder.BIG_ENDIAN)
+        return LinkReport(
+            lossPermille = buf.short.toInt() and 0xFFFF,
+            maxBurst = buf.get().toInt() and 0xFF,
+            stalls = buf.get().toInt() and 0xFF,
+            late = buf.short.toInt() and 0xFFFF,
+            concealed = buf.short.toInt() and 0xFFFF,
+            targetMs = buf.short.toInt() and 0xFFFF,
+        )
     }
 }

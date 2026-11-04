@@ -18,6 +18,7 @@ from protocol import (
     TYPE_AUDIO_PC_TO_ANDROID, TYPE_AUDIO_ANDROID_TO_PC, TYPE_CONTROL,
 )
 from crypto import PacketCipher, AntiReplayWindow
+from link_quality import LinkMeter
 
 
 class UDPStream:
@@ -43,6 +44,7 @@ class UDPStream:
         self._send_lock = threading.Lock()
         self._replay = AntiReplayWindow()
         self._sock = sock
+        self.meter = LinkMeter()   # loss of the incoming stream, for our link reports
 
         self._peer: tuple[str, int] | None = None
         self._running = False
@@ -92,8 +94,14 @@ class UDPStream:
                 data, addr = self._sock.recvfrom(2048)
             except socket.timeout:
                 continue
+            except ConnectionResetError:
+                # Windows reports an ICMP "port unreachable" for an earlier send as a
+                # reset on the next recv. It says nothing about this socket, which
+                # still works — ending the loop here would turn a momentary hiccup
+                # (phone app restarting its socket, a router blip) into a dead session.
+                continue
             except OSError:
-                break
+                break  # socket closed by stop()
 
             # Reject packets not from the paired peer
             if self._peer and addr[0] != self._peer[0]:
@@ -115,6 +123,7 @@ class UDPStream:
                 continue
             # Only authenticated packets may advance the replay window.
             self._replay.commit(pkt.counter)
+            self.meter.packet(pkt.counter)
 
             if pkt.type == TYPE_AUDIO_ANDROID_TO_PC:
                 self._on_audio(plaintext)

@@ -64,6 +64,20 @@ object CryptoEngine {
         return mac.doFinal(Protocol.UNKNOWN_TAG + transcript(pcId, pcEph, phId, phEph))
     }
 
+    /** PC's authenticated "the user declined the code" (mirrors pc/crypto.py cancel_mac). */
+    fun cancelMac(keys: SessionKeys, pcId: ByteArray, pcEph: ByteArray, phId: ByteArray, phEph: ByteArray): ByteArray {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(keys.confirmKey, "HmacSHA256"))
+        return mac.doFinal(Protocol.CANCEL_TAG + transcript(pcId, pcEph, phId, phEph))
+    }
+
+    /** Our authenticated "the user rejected this PC", so a bystander can't abort the PC's connect (mirrors reject_mac). */
+    fun rejectMac(keys: SessionKeys, pcId: ByteArray, pcEph: ByteArray, phId: ByteArray, phEph: ByteArray): ByteArray {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(keys.confirmKey, "HmacSHA256"))
+        return mac.doFinal(Protocol.REJECT_TAG + transcript(pcId, pcEph, phId, phEph))
+    }
+
     /** Commitment to the PC's ephemeral key, sent in CONNECT_REQ before the key itself (mirrors pc/crypto.py). */
     fun commitment(pcEph: ByteArray): ByteArray =
         MessageDigest.getInstance("SHA-256").digest(Protocol.COMMIT_TAG + pcEph)
@@ -104,31 +118,29 @@ object CryptoEngine {
         ByteBuffer.allocate(9).order(ByteOrder.BIG_ENDIAN)
             .put(type).putLong(counter).array()
 
-    fun encryptPacket(
-        key: ByteArray,
-        streamId: Int,
-        counter: Long,
-        type: Byte,
-        plaintext: ByteArray,
-    ): ByteArray {
-        val c = cipher.get()!!
-        c.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "ChaCha20"), IvParameterSpec(makeNonce(streamId, counter)))
-        c.updateAAD(makeAad(type, counter))
-        return c.doFinal(plaintext)
-    }
+    /**
+     * ChaCha20-Poly1305 under one session key (mirrors pc/crypto.py PacketCipher):
+     * the key object is built once per session, not once per packet.
+     */
+    class PacketCipher(key: ByteArray) {
+        private val keySpec = SecretKeySpec(key, "ChaCha20")
 
-    fun decryptPacket(
-        key: ByteArray,
-        streamId: Int,
-        counter: Long,
-        type: Byte,
-        ciphertext: ByteArray,
-    ): ByteArray? = runCatching {
-        val c = cipher.get()!!
-        c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "ChaCha20"), IvParameterSpec(makeNonce(streamId, counter)))
-        c.updateAAD(makeAad(type, counter))
-        c.doFinal(ciphertext)
-    }.getOrNull()
+        fun encrypt(streamId: Int, counter: Long, type: Byte, plaintext: ByteArray): ByteArray {
+            val c = cipher.get()!!
+            c.init(Cipher.ENCRYPT_MODE, keySpec, IvParameterSpec(makeNonce(streamId, counter)))
+            c.updateAAD(makeAad(type, counter))
+            return c.doFinal(plaintext)
+        }
+
+        /** Decrypts data[offset, offset + length) in place of the receive buffer — no copy of the ciphertext. */
+        fun decrypt(streamId: Int, counter: Long, type: Byte, data: ByteArray, offset: Int, length: Int): ByteArray? =
+            runCatching {
+                val c = cipher.get()!!
+                c.init(Cipher.DECRYPT_MODE, keySpec, IvParameterSpec(makeNonce(streamId, counter)))
+                c.updateAAD(makeAad(type, counter))
+                c.doFinal(data, offset, length)
+            }.getOrNull()
+    }
 
     // ---------------------------------------------------------------------------
     // Anti-replay window

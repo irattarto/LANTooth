@@ -33,7 +33,8 @@ from audio_engine import (
 from config import forget_ip, load_config, remember_ip, save_config
 from identity import load_or_create_identity
 from pairing import ConnectCancelled, ConnectClient
-from protocol import PAIRING_PORT
+from protocol import DSCP_VALUES, PAIRING_PORT
+import qos
 from version import __version__
 from session import (
     END_BYE, END_ERROR, SessionStats, connect_once, stream_session,
@@ -45,6 +46,7 @@ RECONNECT_DELAY_S = 5.0
 CONNECT_ATTEMPT_TIMEOUT_S = 45.0   # first pairing needs time to compare the code on both devices
 SYSTEM_DEFAULT_PLAYBACK_LABEL = "System default (monitor only)"
 SYSTEM_DEFAULT_LOOPBACK_LABEL = "System default output [WASAPI loopback]"
+DSCP_LABELS = {48: "48 (CS6) — voice queue on most access points (recommended)", 46: "46 (EF) — standard voice mark"}
 _ICON_FILE = "lantooth_icon.png"
 
 
@@ -99,7 +101,7 @@ class StreamWorker:
         return self.is_running() and self._stop.is_set()
 
     def start(self, android_ip, capture_backend, capture_device, playback_device, media_channels,
-              mic_agc=True, exclusive=False) -> bool:
+              mic_agc=True, exclusive=False, dscp=DSCP_VALUES[0]) -> bool:
         if self.is_running():
             return False
         self._stop.clear()
@@ -109,7 +111,7 @@ class StreamWorker:
         self._thread = threading.Thread(
             target=self._run,
             args=(self.generation, android_ip, capture_backend, capture_device,
-                  playback_device, media_channels, mic_agc, exclusive),
+                  playback_device, media_channels, mic_agc, exclusive, dscp),
             daemon=True,
             name="lantooth-worker",
         )
@@ -145,14 +147,16 @@ class StreamWorker:
             self._thread.join(timeout)
 
     def _run(self, gen, android_ip, capture_backend, capture_device, playback_device, media_channels,
-             mic_agc, exclusive) -> None:
+             mic_agc, exclusive, dscp) -> None:
         def status(text: str) -> None:
             self._q.put(("status", text, gen))
 
         def stats(s: SessionStats) -> None:
             self._q.put(("stats", (
-                f"to phone: {s.sent}   from phone: {s.received} recv · {s.recovered} recovered · "
-                f"{s.concealed} lost · {s.underruns} underruns   buffer {s.target_depth * codec.FRAME_MS} ms"
+                f"to phone: {s.sent} · {s.phone_loss:.1%} loss · {s.bitrate // 1000} kbps · "
+                f"{s.redundancy}x redundancy\n"
+                f"from phone: {s.received} recv · {s.mic_loss:.1%} loss · {s.recovered} recovered · "
+                f"{s.concealed} lost · {s.stalls} stalls   buffer {s.target_depth * codec.FRAME_MS} ms"
             ), gen))
 
         final = ""
@@ -163,7 +167,7 @@ class StreamWorker:
                     session, our_stream_id, audio_sock = connect_once(
                         self._client, android_ip, PAIRING_PORT, self._identity_priv,
                         self._display_name, media_channels=media_channels,
-                        timeout=CONNECT_ATTEMPT_TIMEOUT_S, stop_event=self._stop,
+                        timeout=CONNECT_ATTEMPT_TIMEOUT_S, stop_event=self._stop, dscp=dscp,
                     )
                 except ConnectCancelled:
                     break
@@ -219,8 +223,8 @@ class LanToothGUI:
 
         self.root = tk.Tk()
         self.root.title(f"LANTooth {__version__}")
-        self.root.geometry("640x430")
-        self.root.minsize(480, 410)
+        self.root.geometry("640x470")
+        self.root.minsize(480, 450)
         self.root.resizable(True, True)
         self.root.protocol("WM_DELETE_WINDOW", self._hide_to_tray)
         self.root.bind("<Unmap>", self._on_unmap)
@@ -295,31 +299,40 @@ class LanToothGUI:
             variable=self.exclusive_var,
         ).grid(row=5, column=1, sticky="w", **pad)
 
+        ttk.Label(frm, text="Wi-Fi priority mark:").grid(row=6, column=0, sticky="w", **pad)
+        qos_row = ttk.Frame(frm)
+        qos_row.grid(row=6, column=1, sticky="we", **pad)
+        self.dscp_combo = ttk.Combobox(qos_row, state="readonly", width=40,
+                                       values=[DSCP_LABELS[v] for v in DSCP_VALUES])
+        self.dscp_combo.current(DSCP_VALUES.index(self.cfg.get("dscp", DSCP_VALUES[0])))
+        self.dscp_combo.pack(side="left", fill="x", expand=True)
+        ttk.Button(qos_row, text="Set up…", width=10, command=self._setup_qos).pack(side="left", padx=(6, 0))
+
         btn_row = ttk.Frame(frm)
-        btn_row.grid(row=6, column=0, columnspan=2, sticky="we", **pad)
+        btn_row.grid(row=7, column=0, columnspan=2, sticky="we", **pad)
         self.connect_btn = ttk.Button(btn_row, text="Connect", command=self._toggle_connect)
         self.connect_btn.pack(side="left", fill="x", expand=True)
         ttk.Button(btn_row, text="Latency test", width=14, command=self._latency_test).pack(side="left", padx=(6, 0))
 
         self.status_var = tk.StringVar(value="Idle")
         self.status_label = ttk.Label(frm, textvariable=self.status_var, wraplength=560)
-        self.status_label.grid(row=7, column=0, columnspan=2, sticky="w", **pad)
+        self.status_label.grid(row=8, column=0, columnspan=2, sticky="w", **pad)
 
         self.stats_var = tk.StringVar(value="")
         self.stats_label = ttk.Label(frm, textvariable=self.stats_var, wraplength=560, foreground="#666")
-        self.stats_label.grid(row=8, column=0, columnspan=2, sticky="w", **pad)
+        self.stats_label.grid(row=9, column=0, columnspan=2, sticky="w", **pad)
 
         self.playback_hint_var = tk.StringVar(value="")
         self.playback_hint_label = ttk.Label(
             frm, textvariable=self.playback_hint_var, wraplength=560, foreground="#888"
         )
-        self.playback_hint_label.grid(row=9, column=0, columnspan=2, sticky="w", **pad)
+        self.playback_hint_label.grid(row=10, column=0, columnspan=2, sticky="w", **pad)
 
         self.footer_label = ttk.Label(
             frm, text="Closing this window minimizes to the tray — use Quit there to exit.",
             wraplength=560, foreground="#888",
         )
-        self.footer_label.grid(row=10, column=0, columnspan=2, sticky="w", **pad)
+        self.footer_label.grid(row=11, column=0, columnspan=2, sticky="w", **pad)
 
         frm.columnconfigure(1, weight=1)
 
@@ -470,6 +483,7 @@ class LanToothGUI:
         stereo = self.stereo_var.get()
         agc = self.agc_var.get()
         exclusive = self.exclusive_var.get()
+        dscp = self._selected_dscp()
 
         # The IP itself is remembered only once a connection succeeds ("connected").
         self.cfg.update({
@@ -478,11 +492,47 @@ class LanToothGUI:
             "stereo": stereo,
             "mic_agc": agc,
             "wasapi_exclusive": exclusive,
+            "dscp": dscp,
         })
         save_config(self.cfg)
 
-        if self.worker.start(ip, backend, cap_idx, play_idx, 2 if stereo else 1, agc, exclusive):
+        if self.worker.start(ip, backend, cap_idx, play_idx, 2 if stereo else 1, agc, exclusive, dscp):
             self.connect_btn.config(text="Disconnect")
+
+    def _selected_dscp(self) -> int:
+        i = self.dscp_combo.current()
+        return DSCP_VALUES[i] if i >= 0 else DSCP_VALUES[0]
+
+    def _setup_qos(self) -> None:
+        """Create/remove the Windows QoS policy that lets the audio packets carry the
+        Wi-Fi priority mark (qos.py). Needs administrator rights once."""
+        if not qos.available():
+            messagebox.showinfo("LANTooth", "Wi-Fi priority can only be set up from the installed LANTooth.exe.")
+            return
+        dscp = self._selected_dscp()
+        answer = messagebox.askyesnocancel(
+            "Wi-Fi priority",
+            f"Mark LANTooth's audio packets with priority {dscp}, so the Wi-Fi access point sends "
+            "them to the phone ahead of other traffic?\n\nWindows asks for administrator rights once. "
+            "The phone uses the same mark from the next connection.\n\n"
+            "Yes = enable · No = remove the setting · Cancel = do nothing",
+        )
+        if answer is None:
+            return
+        self.cfg["dscp"] = dscp
+        save_config(self.cfg)
+        self.status_var.set("Waiting for the administrator prompt…")
+
+        def work() -> None:
+            try:
+                qos.enable(dscp) if answer else qos.disable()
+                text = (f"Wi-Fi priority {dscp} enabled — applies from the next connection" if answer
+                        else "Wi-Fi priority setting removed")
+            except qos.QosError as e:
+                text = f"Wi-Fi priority not changed: {e}"
+            self.msg_queue.put(("status", text, self.worker.generation))
+
+        threading.Thread(target=work, daemon=True, name="lantooth-qos").start()
 
     def _latency_test(self) -> None:
         if not self.worker.is_running() or self.worker.is_stopping():

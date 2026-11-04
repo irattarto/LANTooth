@@ -87,4 +87,5 @@ dependencies {
     implementation(libs.androidx.media)
     implementation(libs.tink.android)
     implementation(libs.coroutines.android)
+    testImplementation(libs.junit)
 }

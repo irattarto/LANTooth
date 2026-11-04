@@ -6,6 +6,7 @@ import os
 import tempfile
 
 from appdata import app_data_dir
+from protocol import DEFAULT_DSCP, DSCP_VALUES
 
 CONFIG_PATH = os.path.join(app_data_dir(), "gui_config.json")
 
@@ -19,6 +20,7 @@ _DEFAULTS = {
     "stereo": True,
     "mic_agc": True,            # level the phone mic (mic_agc.py)
     "wasapi_exclusive": False,  # exclusive-mode WASAPI playback of the phone mic
+    "dscp": DEFAULT_DSCP,       # Wi-Fi priority mark of the audio packets (protocol.DSCP_VALUES)
 }
 
 
@@ -31,6 +33,8 @@ def load_config() -> dict:
     cfg = {**_DEFAULTS, **{k: v for k, v in data.items() if k in _DEFAULTS}}
     if not isinstance(cfg["recent_ips"], list):
         cfg["recent_ips"] = []
+    if cfg["dscp"] not in DSCP_VALUES:
+        cfg["dscp"] = DEFAULT_DSCP
     return cfg
 
 

@@ -10,7 +10,7 @@ private const val TAG = "LANTooth/Jitter"
 private const val FRAME_S = Codec.FRAME_MS / 1000.0
 private fun frames(ms: Int) = maxOf(1, ms / Codec.FRAME_MS)
 
-private val MIN_DEPTH = frames(30)           // floor for the target cushion
+private val MIN_DEPTH = frames(20)           // floor for the target cushion
 private val MAX_DEPTH = frames(160)
 private val DEFAULT_DEPTH = frames(40)       // until enough arrivals have been measured
 private val PLC_FRAMES = frames(60)          // Opus PLC ticks before fading to silence
@@ -27,6 +27,8 @@ private val MIN_TRANSIT_SAMPLES = frames(500)
 // network jitter — forget the old transit history, since the next burst's
 // transit times carry a new constant offset.
 private const val SENDER_PAUSE_S = 1.0
+// How long a stall keeps the target raised to the depth that would have covered it.
+private const val PEAK_HOLD_S = 20.0
 
 /**
  * Adaptive jitter buffer for an incoming Opus stream — same algorithm as the PC's
@@ -35,8 +37,8 @@ private const val SENDER_PAUSE_S = 1.0
  * the audio writer loop), so decoding is paced by the real playback clock.
  * Per tick:
  *
- *   1. Expected frame present (received directly, or recovered from the
- *      redundant copy the NEXT packet carries)               -> decode it.
+ *   1. Expected frame present (received directly, or recovered from a
+ *      redundant copy one of the next packets carries)       -> decode it.
  *   2. Missing, but later frames are buffered (a real loss)  -> conceal, move on.
  *   3. Nothing buffered at all (underrun)                    -> conceal, HOLD the
  *      play cursor and re-buffer up to the target depth, instead of free-running
@@ -44,12 +46,20 @@ private const val SENDER_PAUSE_S = 1.0
  *
  * Concealment is Opus PLC for the first PLC_FRAMES ticks, then silence; the last
  * PLC frame fades out and the first real frame after silence fades in. The
- * target depth follows the ~95th percentile spread of packet transit times;
+ * target depth follows the ~95th percentile spread of packet transit times
+ * (the sender's seq advances with real time while it sends nothing, so a pause
+ * is a seq jump, not apparent delay). An underrun the network caused — packets
+ * arriving while we wait came later than the cushion could cover — is a stall:
+ * the target is raised at once to cover it and held for PEAK_HOLD_S after the
+ * last one, since short periodic Wi-Fi stalls fall under the percentile;
  * when the buffer sits above target for a while (burst, clock drift) one frame
  * is dropped to bring latency back down — preferably a quiet one, and always
  * crossfaded into the next so the cut is inaudible.
  */
-class JitterBuffer(private val decoder: Codec.Decoder) {
+class JitterBuffer(
+    private val decoder: Codec.Decoder,
+    private val clock: () -> Double = { SystemClock.elapsedRealtimeNanos() / 1e9 },
+) {
     private val frames = HashMap<Long, ByteArray>()
     private val redundant = HashSet<Long>()
     private var lastPlayed: Long? = null
@@ -63,6 +73,11 @@ class JitterBuffer(private val decoder: Codec.Decoder) {
     private var transitHead = 0
     private var lastArrival = -1.0
     private var sinceTarget = 0
+    private var percentileDepth = DEFAULT_DEPTH
+    private var peakDepth = 0
+    private var peakUntil = Double.NEGATIVE_INFINITY
+    private var inUnderrun = false   // ran dry while playing, not refilled yet
+    private var stallSeen = false    // ...and arrivals since showed it was the network
 
     @Volatile var targetDepth = DEFAULT_DEPTH
         private set
@@ -80,13 +95,23 @@ class JitterBuffer(private val decoder: Codec.Decoder) {
         private set
     @Volatile var decodeErrors = 0
         private set
+    @Volatile var stalls = 0         // underruns caused by late packets (not a sender pause)
+        private set
 
     val channels: Int get() = decoder.channels
 
+    /** Frame [seq], plus redundant copies of the frames before it (older[i] is seq - 1 - i). */
     @Synchronized
-    fun push(seq: Long, opus: ByteArray, prevOpus: ByteArray?) {
+    fun push(seq: Long, opus: ByteArray, older: List<ByteArray> = emptyList()) {
         received++
-        trackArrival(seq, SystemClock.elapsedRealtimeNanos() / 1e9)
+        val now = clock()
+        trackArrival(seq, now)
+        if (inUnderrun) {
+            // Ran dry: held back by the network if this packet's transit exceeds
+            // the fastest recent one by more than the cushion we had.
+            val excess = transits[(transitHead - 1 + TRANSIT_WINDOW) % TRANSIT_WINDOW] - minTransit()
+            if (excess > targetDepth * FRAME_S) onStall(now, excess)
+        }
 
         val lp = lastPlayed
         if (lp != null && seq <= lp) {
@@ -96,10 +121,13 @@ class JitterBuffer(private val decoder: Codec.Decoder) {
         frames[seq] = opus
         redundant.remove(seq)
 
-        val prev = seq - 1
-        if (prevOpus != null && (lp == null || prev > lp) && !frames.containsKey(prev)) {
-            frames[prev] = prevOpus
-            redundant.add(prev)
+        for (i in older.indices) {
+            val s = seq - 1 - i
+            if (lp != null && s <= lp) break
+            if (!frames.containsKey(s)) {
+                frames[s] = older[i]
+                redundant.add(s)
+            }
         }
 
         if (frames.size > MAX_FRAMES) {
@@ -124,8 +152,33 @@ class JitterBuffer(private val decoder: Codec.Decoder) {
             sinceTarget = 0
             val s = transits.copyOf(transitCount).also { it.sort() }
             val spread = s[(0.95 * (transitCount - 1)).toInt()] - s[0]
-            targetDepth = (ceil(spread / FRAME_S).toInt() + 1).coerceIn(MIN_DEPTH, MAX_DEPTH)
+            percentileDepth = (ceil(spread / FRAME_S).toInt() + 1).coerceIn(MIN_DEPTH, MAX_DEPTH)
+            updateTarget(now)
         }
+    }
+
+    private fun minTransit(): Double {
+        var m = Double.POSITIVE_INFINITY
+        for (i in 0 until transitCount) m = minOf(m, transits[i])
+        return m
+    }
+
+    /** An arrival [excess] s later than the fastest recent one ended an underrun: cover that. */
+    private fun onStall(now: Double, excess: Double) {
+        if (!stallSeen) {
+            stallSeen = true
+            stalls++
+        }
+        // +2: one frame for the playback tick's phase against arrivals, one of margin.
+        val depth = minOf(MAX_DEPTH, ceil(excess / FRAME_S).toInt() + 2)
+        peakDepth = if (now >= peakUntil) depth else maxOf(peakDepth, depth)
+        peakUntil = now + PEAK_HOLD_S
+        updateTarget(now)
+    }
+
+    private fun updateTarget(now: Double) {
+        val peak = if (now < peakUntil) peakDepth else 0
+        targetDepth = maxOf(percentileDepth, peak)
     }
 
     @Synchronized
@@ -133,6 +186,7 @@ class JitterBuffer(private val decoder: Codec.Decoder) {
         if (buffering) {
             if (frames.size < targetDepth) return conceal()
             buffering = false
+            inUnderrun = false
             val first = frames.keys.min()
             val lp = lastPlayed
             if (lp == null || first > lp + 1) lastPlayed = first - 1
@@ -154,6 +208,8 @@ class JitterBuffer(private val decoder: Codec.Decoder) {
             if (frames.isEmpty()) {
                 underruns++
                 buffering = true
+                inUnderrun = true
+                stallSeen = false
                 return conceal()
             }
             concealed++

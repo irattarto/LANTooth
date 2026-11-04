@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.4.0] — 2026-11-04 (test release)
+
+Steadier sound on Wi-Fi without extra latency. **Protocol v6: update the PC app
+and the phone app together.**
+- Both: each side reports packet loss, loss bursts and stalls to the other twice
+  a second. The sender then repeats up to three earlier frames in each packet
+  when losses come in bursts (previously one), sets the Opus loss hint from the
+  measured loss, and lowers the bitrate only while the link is bad. Full
+  quality returns after 15 s without loss.
+- Both: the jitter buffer reacts to short Wi-Fi stalls straight away and keeps
+  enough buffer for them for 20 s, instead of dropping out at every stall. On a
+  clean link its minimum is now 20 ms (was 30 ms).
+- Fixed: a short pause in the audio (push-to-talk released for under a second,
+  PC audio going briefly silent) looked like network delay and pushed latency
+  up to 160 ms for several seconds.
+- Fixed (PC): a Windows network error could stop the PC receiving audio and
+  end the session after 6 s instead of continuing.
+- Security: a bystander on the network can no longer fake a "declined" or
+  "rejected" pairing message to abort a connection.
+- PC: new **Wi-Fi priority mark** setting with a **Set up…** button. It creates
+  the Windows QoS policy (one administrator prompt) so the access point
+  prioritizes LANTooth's audio. The phone uses the same mark.
+- PC: the stats line shows loss, bitrate and redundancy for each direction.
+- Phone: fewer memory allocations per audio packet.
+
 ## [0.3.0] — 2026-10-23 (test release)
 
 Lower latency and better sound. **Protocol v5: update the PC app and the phone
